@@ -1180,12 +1180,24 @@ def page_send():
                     default_pos = pos
                     break
 
-        choice = st.selectbox(
-            f"Up next · {len(queue_idx)} in queue",
-            options=queue_idx,
-            index=default_pos,
-            format_func=lambda i: f"{display_name(df.loc[i])} — {display_song(df.loc[i])}",
-        )
+        nav_l, nav_mid, nav_r = st.columns([1, 10, 1], vertical_alignment="bottom")
+        with nav_l:
+            if st.button("◀", key="send_prev", help="Previous artist", width="stretch"):
+                new_pos = (default_pos - 1) % len(queue_idx)
+                st.session_state["send_current_id"] = df.loc[queue_idx[new_pos], "Channel_ID"]
+                st.rerun()
+        with nav_mid:
+            choice = st.selectbox(
+                f"Up next · {default_pos + 1} of {len(queue_idx)} in queue",
+                options=queue_idx,
+                index=default_pos,
+                format_func=lambda i: f"{display_name(df.loc[i])} — {display_song(df.loc[i])}",
+            )
+        with nav_r:
+            if st.button("▶", key="send_next", help="Next artist", width="stretch"):
+                new_pos = (default_pos + 1) % len(queue_idx)
+                st.session_state["send_current_id"] = df.loc[queue_idx[new_pos], "Channel_ID"]
+                st.rerun()
         st.session_state["send_current_id"] = df.loc[choice, "Channel_ID"]
         row = df.loc[choice]
 
