@@ -9,6 +9,7 @@ Artist-AI-Outreach apps.
 
 import io
 import os
+import html as html_escape
 import uuid
 import re
 import json
@@ -650,6 +651,96 @@ def vu_meter(label, count, total):
       <div style="font-family:'IBM Plex Mono',monospace;font-size:0.7rem;letter-spacing:.12em;text-transform:uppercase;opacity:.6;">{label}</div>
     </div>"""
 
+REPORT_CSS = """
+body{margin:0;background:#0A0A0C;color:#F4F2ED;font-family:'Inter',-apple-system,sans-serif;}
+.wrap{max-width:820px;margin:0 auto;padding:48px 28px;}
+.eyebrow{font-family:'IBM Plex Mono',monospace;font-size:12px;letter-spacing:.14em;color:#9AA3B2;text-transform:uppercase;}
+h1{font-family:'Space Grotesk',sans-serif;font-size:40px;letter-spacing:.02em;text-transform:uppercase;margin:6px 0 28px;}
+h2{font-family:'Space Grotesk',sans-serif;font-size:18px;margin:36px 0 14px;color:#F0A93B;text-transform:uppercase;letter-spacing:.06em;}
+.cards{display:flex;gap:14px;flex-wrap:wrap;}
+.card{flex:1;min-width:150px;background:#151518;border:1px solid rgba(255,255,255,.08);border-radius:10px;padding:18px;}
+.card .v{font-family:'Space Grotesk',sans-serif;font-size:30px;font-weight:700;}
+.card .l{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.12em;text-transform:uppercase;color:#9AA3B2;margin-top:6px;}
+.frow{display:flex;align-items:center;gap:12px;margin:9px 0;}
+.frow .fl{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#9AA3B2;width:110px;flex-shrink:0;}
+.bar{flex:1;height:22px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:5px;overflow:hidden;}
+.fill{height:100%;}
+.frow .fc{font-family:'Space Grotesk',sans-serif;font-weight:700;width:90px;text-align:right;flex-shrink:0;}
+table{width:100%;border-collapse:collapse;margin-top:8px;}
+th{font-family:'IBM Plex Mono',monospace;font-size:11px;letter-spacing:.1em;text-transform:uppercase;color:#9AA3B2;text-align:left;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.12);}
+td{padding:9px 10px;border-bottom:1px solid rgba(255,255,255,.06);font-size:14px;}
+td.money{color:#EFC94C;font-family:'Space Grotesk',sans-serif;font-weight:700;}
+.foot{margin-top:44px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5b616c;letter-spacing:.1em;text-transform:uppercase;}
+"""
+
+def build_report_html(df):
+    stats = pipeline_stats(df)
+    now = pd.Timestamp.now()
+
+    def pct(a, b):
+        return "—" if not b else f"{a / b * 100:.0f}%"
+
+    contacted_dates = pd.to_datetime(df["Reached_Out_Date"], errors="coerce") if not df.empty else pd.Series(dtype="datetime64[ns]")
+    c7 = int((contacted_dates >= now - pd.Timedelta(days=7)).sum()) if not df.empty else 0
+    c30 = int((contacted_dates >= now - pd.Timedelta(days=30)).sum()) if not df.empty else 0
+    due = len(follow_ups_due(df)) if not df.empty else 0
+    avg_client = f"${stats['revenue'] / stats['paid']:,.0f}" if stats["paid"] else "—"
+    rev_per_contact = f"${stats['revenue'] / stats['contacted']:,.2f}" if stats["contacted"] else "—"
+
+    stages = [("Leads", stats["total"]), ("Contactable", stats["contactable"]), ("Drafted", stats["drafted"]),
+              ("Contacted", stats["contacted"]), ("Replied", stats["replied"]),
+              ("Free Mix", stats["free_mix"]), ("Paid", stats["paid"])]
+    funnel = ""
+    for label, count in stages:
+        hi, lo = STAGE_COLORS.get(label, (ACCENT, "#7A5210"))
+        width = 0 if stats["total"] == 0 or count == 0 else max(2, round(100 * count / stats["total"]))
+        share = pct(count, stats["total"])
+        funnel += (f'<div class="frow"><div class="fl">{label}</div>'
+                   f'<div class="bar"><div class="fill" style="width:{width}%;background:linear-gradient(90deg,{lo},{hi});"></div></div>'
+                   f'<div class="fc">{count} · {share}</div></div>')
+
+    clients_rows = ""
+    if not df.empty and df["Paid Customer"].any():
+        top = df[df["Paid Customer"]].sort_values("Revenue", ascending=False).head(15)
+        for _, r in top.iterrows():
+            name = html_escape.escape(display_name(r))
+            mix = "✓" if r.get("Free Mix Sent", False) else "—"
+            clients_rows += f'<tr><td>{name}</td><td>{mix}</td><td class="money">${float(r["Revenue"]):,.0f}</td></tr>'
+    else:
+        clients_rows = '<tr><td colspan="3" style="color:#9AA3B2;">No paying clients yet — they land here.</td></tr>'
+
+    return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<title>WavyMixing — Outreach Report {now:%Y-%m-%d}</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>{REPORT_CSS}</style></head><body><div class="wrap">
+<div class="eyebrow">WAVYMIXING · OUTREACH REPORT · {now:%b %d, %Y}</div>
+<h1>Pipeline Report</h1>
+<div class="cards">
+  <div class="card"><div class="v" style="color:#EFC94C;">${stats["revenue"]:,.0f}</div><div class="l">Revenue</div></div>
+  <div class="card"><div class="v">{stats["paid"]}</div><div class="l">Paying clients</div></div>
+  <div class="card"><div class="v">{avg_client}</div><div class="l">Avg per client</div></div>
+  <div class="card"><div class="v">{stats["free_mix"]}</div><div class="l">Free mixes done</div></div>
+</div>
+<h2>Funnel</h2>
+{funnel}
+<h2>Conversion rates</h2>
+<div class="cards">
+  <div class="card"><div class="v">{pct(stats["replied"], stats["contacted"])}</div><div class="l">Reply rate</div></div>
+  <div class="card"><div class="v">{pct(stats["free_mix"], stats["replied"])}</div><div class="l">Replies → mixes</div></div>
+  <div class="card"><div class="v">{pct(stats["paid"], stats["free_mix"])}</div><div class="l">Mixes → paid</div></div>
+  <div class="card"><div class="v">{rev_per_contact}</div><div class="l">Revenue / contact</div></div>
+</div>
+<h2>Activity</h2>
+<div class="cards">
+  <div class="card"><div class="v">{c7}</div><div class="l">Contacted · 7 days</div></div>
+  <div class="card"><div class="v">{c30}</div><div class="l">Contacted · 30 days</div></div>
+  <div class="card"><div class="v">{due}</div><div class="l">Follow-ups due</div></div>
+</div>
+<h2>Paying clients</h2>
+<table><tr><th>Artist</th><th>Free mix</th><th>Revenue</th></tr>{clients_rows}</table>
+<div class="foot">Generated by Wavy Outreach · wavymixing.com</div>
+</div></body></html>"""
+
 def highlight_rows(row):
     color = ''
     if row.get('Paid Customer', False):
@@ -725,6 +816,14 @@ def page_dashboard():
     due = follow_ups_due(df)
     with m3, st.container(border=True):
         st.metric("Follow-ups due", len(due))
+
+    st.download_button(
+        "📄 Download CRM report (.html)",
+        data=build_report_html(df).encode("utf-8"),
+        file_name=f"wavymixing_outreach_report_{pd.Timestamp.now():%Y-%m-%d}.html",
+        mime="text/html",
+        help="A self-contained report of your funnel, revenue, and conversion rates — opens in any browser.",
+    )
 
     # Next actions, computed from the data
     st.subheader("Next up")
