@@ -75,14 +75,14 @@ COLUMN_ORDER = [
     "🗑️ Blacklist", "Reached Out", "Replied", "Reached_Out_Date",
     "Channel_ID", "Channel Name", "Cleaned Artist", "Cleaned Song",
     "Song Name", "Subscribers", "Email Address", "Instagram", "IG Followers",
-    "IG Bio", "Draft Email", "Draft DM", "🔄 Regenerate",
+    "IG Bio", "Draft Message", "🔄 Regenerate",
     "Channel_URL", "Google Search Status", "🔍 Quick Search",
 ]
 
 TEXT_DEFAULTS = {
     "Channel_ID": "", "Channel Name": "", "Cleaned Artist": "", "Cleaned Song": "",
     "Song Name": "Unknown", "Email Address": "None Found", "Instagram": "None",
-    "IG Bio": "Not Scanned", "Draft Email": "", "Draft DM": "",
+    "IG Bio": "Not Scanned", "Draft Message": "",
     "Channel_URL": "", "Google Search Status": "Not Searched", "🔍 Quick Search": "",
 }
 BOOL_COLS = ["🗑️ Blacklist", "Reached Out", "Replied", "🔄 Regenerate"]
@@ -96,6 +96,19 @@ def ensure_schema(df):
     if df is None:
         return pd.DataFrame(columns=COLUMN_ORDER)
     df = df.copy()
+
+    # Migrate the legacy two-draft schema (Draft Email / Draft DM) into the
+    # single Draft Message column, scrubbing old error strings on the way.
+    if "Draft Message" not in df.columns:
+        df["Draft Message"] = ""
+    df["Draft Message"] = df["Draft Message"].fillna("").astype(str).replace("nan", "")
+    for legacy in ["Draft DM", "Draft Email"]:
+        if legacy in df.columns:
+            vals = df[legacy].fillna("").astype(str).replace("nan", "")
+            vals = vals.apply(lambda v: "" if v.strip().startswith("[Claude Error") else v)
+            empty = df["Draft Message"].str.strip() == ""
+            df.loc[empty, "Draft Message"] = vals[empty]
+            df = df.drop(columns=[legacy])
 
     for col, default in TEXT_DEFAULTS.items():
         if col not in df.columns:
@@ -120,8 +133,7 @@ def ensure_schema(df):
     df["Reached_Out_Date"] = pd.to_datetime(df["Reached_Out_Date"], errors="coerce")
 
     # Old "[Claude Error]" strings must never block regeneration
-    for col in ["Draft Email", "Draft DM"]:
-        df[col] = df[col].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
+    df["Draft Message"] = df["Draft Message"].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
 
     # Keep only the first IG link if a comma list slipped in
     df["Instagram"] = df["Instagram"].apply(
@@ -256,14 +268,14 @@ def aggressive_regex_clean(channel_name, video_title):
 # ----------------------------------------------------------------------------
 # AI helpers
 # ----------------------------------------------------------------------------
-ALEX_WAVY_PERSONA = """You are Alex Wavy, a professional trap, drill, and hip-hop mixing and mastering engineer from Europe with over 5 years of experience. You use a high-end hybrid setup of both digital and analog gear.
+ALEX_WAVY_PERSONA = """You are Alex Wavy, a mixing and mastering engineer from Europe who lives in trap, drill, and hip-hop. Over 5 years of experience on a hybrid analog/digital setup.
 
-TONE RULES:
-- Use authentic street/hip-hop language, but keep it professional and respectful.
-- Be highly complimentary of their talent and the specific track.
-- Be confident in your own skills.
-- DO NOT use emojis.
-- DO NOT include subject lines or placeholder brackets like [Your Name] in the output, just the raw body text."""
+VOICE:
+- Real recognizes real: casual, direct, respectful. Like one artist texting another.
+- Short sentences. No corporate talk, no marketing language, no fake friendliness.
+- One genuine line about their music is worth more than five compliments.
+- Mild slang and profanity are fine when natural ("I fuck with your sound").
+- Never use emojis, subject lines, sign-offs, links, or placeholders like [Name]."""
 
 def resolve_gemini_model(client):
     """Pick a Gemini model that actually works on this account.
@@ -356,31 +368,25 @@ def message_config(model):
             pass
     return genai_types.GenerateContentConfig(**kwargs)
 
-def write_with_gemini(client, model, artist, song, msg_type):
-    """Returns (text, error). Error is None on success.
-    Retries with backoff on rate limits — important on Gemini's free tier."""
-    if msg_type == "email":
-        user_prompt = f"""
-        I am doing cold outreach to an artist named '{artist}'. I just listened to their track '{song}'.
+def write_with_gemini(client, model, artist, song):
+    """Returns (text, error). One short message that works as an email or a DM.
+    One API call per artist. Retries with backoff on rate limits."""
+    user_prompt = f"""
+    Write ONE short cold outreach message to an artist named '{artist}' about their track '{song}'.
+    It will be sent exactly as written — sometimes as an email body, sometimes as an Instagram DM — so it must read naturally as both.
 
-        TASK: Write a cold outreach email.
-        - Tell them I really mess with their music and praise their talent.
-        - Introduce myself (Alex Wavy from Europe, 5+ yrs experience, analog/digital gear).
-        - State clearly that I will make it worth their while.
-        - Offer a free sample to show my creative process and what I can do for them.
-        - Call to action: Ask if they are interested, tell them to send a project they are working on, and promise to get it mixed in a day or 2 for free.
-        """
-    else:
-        user_prompt = f"""
-        I am doing cold outreach to an artist named '{artist}'. I just listened to their track '{song}'.
+    Say, in your own words (never copy this phrasing exactly):
+    - You've been listening to '{song}' and you genuinely fuck with their sound.
+    - You're Alex Wavy, a mix engineer for trap, drill and hip-hop (hybrid analog/digital setup, 5+ years).
+    - The offer: they send a track they're working on, you mix it free in a day or two so they can hear what you do.
+    - Close simple: if they're down, send something over. No pressure.
 
-        TASK: Write an Instagram DM.
-        - It MUST be much shorter than an email (3 to 5 sentences max). Highly readable.
-        - Tell them I really mess with '{song}'.
-        - Pitch my mixing/mastering (Alex Wavy from Europe, 5 yrs exp, analog/digital gear).
-        - Offer to mix a track for free in 1-2 days to show them what I can do.
-        - Keep it punchy and direct.
-        """
+    HARD RULES:
+    - 3 to 5 short sentences. Under 60 words total. No greeting line, no sign-off, no subject line.
+    - Sound like a real person from the culture texting another artist. Direct and respectful.
+    - BANNED: salesy or corny words ("opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well"), fake flattery, emojis, links, placeholders.
+    - Vary the structure and wording between artists so messages never look templated.
+    """
 
     sleeps = [3, 8, 20]
     last_err = None
@@ -500,7 +506,7 @@ def google_already_searched(row):
     return str(row.get("Google Search Status", "")).strip().lower().startswith("searched")
 
 def has_any_draft(row):
-    return bool(str(row.get("Draft Email", "")).strip()) or bool(str(row.get("Draft DM", "")).strip())
+    return bool(str(row.get("Draft Message", "")).strip())
 
 def pipeline_stats(df):
     if df.empty:
@@ -520,15 +526,11 @@ def compute_write_targets(df):
     for idx, row in df.iterrows():
         if not is_valid_data(row.get("Cleaned Artist", "")) or not is_valid_data(row.get("Cleaned Song", "")):
             clean_targets.append(idx)
-        has_email = is_valid_data(row.get("Email Address", ""))
-        has_ig = is_valid_data(row.get("Instagram", ""))
+        has_contact = is_valid_data(row.get("Email Address", "")) or is_valid_data(row.get("Instagram", ""))
         force = bool(row.get("🔄 Regenerate", False))
-        de = str(row.get("Draft Email", "")).strip()
-        dd = str(row.get("Draft DM", "")).strip()
-        needs_email = has_email and (not de or de == "nan" or force)
-        needs_dm = has_ig and (not dd or dd == "nan" or force)
-        if needs_email or needs_dm:
-            msg_targets.append((idx, needs_email, needs_dm))
+        dm = str(row.get("Draft Message", "")).strip()
+        if has_contact and (not dm or dm == "nan" or force):
+            msg_targets.append(idx)
     return clean_targets, msg_targets
 
 def enrich_targets(df, scraped_igs, scraped_googles):
@@ -985,7 +987,7 @@ def page_write():
         return
 
     clean_targets, msg_targets = compute_write_targets(df)
-    cleaned_msg_targets = [t for t in msg_targets if t[0] not in set(clean_targets)]
+    cleaned_msg_targets = [i for i in msg_targets if i not in set(clean_targets)]
 
     # ---- Step 1: Clean names ----------------------------------------------
     with st.container(border=True):
@@ -1044,7 +1046,7 @@ def page_write():
     # ---- Step 2: Write messages -------------------------------------------
     with st.container(border=True):
         st.subheader("2 · Write messages (Gemini)")
-        st.caption(f"Drafts an email for leads with an email address and a DM for leads with an Instagram. {len(cleaned_msg_targets)} artists pending.")
+        st.caption(f"One short message per artist — the same text goes out as the email and the DM. One Gemini call per artist. {len(cleaned_msg_targets)} pending.")
         skipped = len(msg_targets) - len(cleaned_msg_targets)
         if skipped:
             st.warning(f"{skipped} artists will be skipped until their names are cleaned in step 1.")
@@ -1070,43 +1072,28 @@ def page_write():
                     total = len(cleaned_msg_targets)
                     fatal_markers = ["api key", "api_key", "unauthenticated", "permission", "not_found"]
                     aborted = None
-                    for pos, (idx, needs_email, needs_dm) in enumerate(cleaned_msg_targets):
+                    for pos, idx in enumerate(cleaned_msg_targets):
                         row = st.session_state.df.loc[idx]
                         artist, song = row["Cleaned Artist"], row["Cleaned Song"]
                         status.info(f"Writing for {artist}... ({pos + 1}/{total})")
 
-                        row_failed = False
-                        if needs_email:
-                            text, err = write_with_gemini(gclient2, model, artist, song, "email")
-                            if text:
-                                st.session_state.df.loc[idx, "Draft Email"] = text
-                                written += 1
-                            else:
-                                errors += 1
-                                last_error = err
-                                row_failed = True
-                        fatal_now = last_error and any(m in str(last_error).lower() for m in fatal_markers)
-                        if needs_dm and not fatal_now:
-                            text, err = write_with_gemini(gclient2, model, artist, song, "dm")
-                            if text:
-                                st.session_state.df.loc[idx, "Draft DM"] = text
-                                written += 1
-                            else:
-                                errors += 1
-                                last_error = err
-                                row_failed = True
+                        text, err = write_with_gemini(gclient2, model, artist, song)
+                        if text:
+                            st.session_state.df.loc[idx, "Draft Message"] = text
+                            st.session_state.df.loc[idx, "🔄 Regenerate"] = False
+                            written += 1
+                            consecutive = 0
+                        else:
+                            errors += 1
+                            last_error = err
+                            consecutive += 1
 
                         if last_error and any(m in str(last_error).lower() for m in fatal_markers):
                             aborted = f"Gemini rejected your key or the model, so the run was halted. Check the key in Settings and try again. Error: {last_error}"
                             break
-
-                        consecutive = consecutive + 1 if row_failed else 0
                         if consecutive >= 3:
                             aborted = f"Gemini failed 3 artists in a row, so the run was stopped. Error: {last_error}"
                             break
-
-                        if not row_failed:
-                            st.session_state.df.loc[idx, "🔄 Regenerate"] = False
                         progress.progress(min(1.0, (pos + 1) / total))
 
                     save_db(st.session_state.df)
@@ -1172,31 +1159,26 @@ def page_send():
 
             with right:
                 email_addr = str(row["Email Address"]).split(",")[0].strip()
-                draft_email = str(row["Draft Email"]).strip()
-                draft_dm = str(row["Draft DM"]).strip()
+                draft = str(row["Draft Message"]).strip()
 
-                if is_valid_data(email_addr) and draft_email:
-                    st.markdown(f"**✉️ Email** · to `{email_addr}`")
+                st.markdown("**💬 Message** · one text, works as the email and the DM")
+                msg = st.text_area("Message", value=draft, height=150, key=f"msg_{choice}", label_visibility="collapsed")
+
+                if is_valid_data(email_addr):
                     subject = st.text_input("Subject", value=f"Your track \"{display_song(row)}\"", key=f"subj_{choice}")
-                    body = st.text_area("Body", value=draft_email, height=220, key=f"body_{choice}", label_visibility="collapsed")
-                    b1, b2 = st.columns(2)
-                    if b1.button("Save email edits", key=f"save_email_{choice}"):
-                        st.session_state.df.loc[choice, "Draft Email"] = body
-                        save_db(st.session_state.df)
-                        st.toast("Email draft saved.")
-                    mailto = f"mailto:{email_addr}?subject={quote(subject, safe='')}&body={quote(body, safe='')}"
-                    b2.link_button("Open in Mail", mailto, type="primary", width="stretch")
-                    st.divider()
 
-                if is_valid_data(row["Instagram"]) and draft_dm:
-                    st.markdown("**📸 Instagram DM** · tap the copy icon, then paste it on their profile")
-                    st.code(draft_dm, language=None, wrap_lines=True)
-                    with st.expander("Edit DM"):
-                        dm_edit = st.text_area("DM text", value=draft_dm, height=140, key=f"dm_{choice}", label_visibility="collapsed")
-                        if st.button("Save DM edits", key=f"save_dm_{choice}"):
-                            st.session_state.df.loc[choice, "Draft DM"] = dm_edit
-                            save_db(st.session_state.df)
-                            st.toast("DM draft saved.")
+                b1, b2 = st.columns(2)
+                if b1.button("Save edits", key=f"save_msg_{choice}", width="stretch"):
+                    st.session_state.df.loc[choice, "Draft Message"] = msg
+                    save_db(st.session_state.df)
+                    st.toast("Message saved.")
+                if is_valid_data(email_addr):
+                    mailto = f"mailto:{email_addr}?subject={quote(subject, safe='')}&body={quote(msg, safe='')}"
+                    b2.link_button("Open in Mail", mailto, type="primary", width="stretch")
+
+                if is_valid_data(row["Instagram"]):
+                    st.caption("DM: tap the copy icon, then paste it on their profile")
+                    st.code(msg, language=None, wrap_lines=True)
 
             st.divider()
             a1, a2, a3 = st.columns([2, 1, 1])
@@ -1286,8 +1268,7 @@ def page_leads():
             "Channel_ID": None,
             "Channel_URL": None,
             "Song Name": None,
-            "Draft Email": None,
-            "Draft DM": None,
+            "Draft Message": None,
             "🗑️ Blacklist": st.column_config.CheckboxColumn("🗑️", help="Remove and ban this channel."),
             "Reached Out": st.column_config.CheckboxColumn("Reached Out"),
             "Replied": st.column_config.CheckboxColumn("Replied"),
