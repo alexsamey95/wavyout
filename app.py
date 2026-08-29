@@ -357,60 +357,59 @@ def clean_with_gemini(client, model, channel_name, video_title):
     except Exception as e:
         return str(channel_name).strip(), pre_cleaned, str(e)
 
-def message_config(model):
-    kwargs = {"system_instruction": ALEX_WAVY_PERSONA}
-    if str(model).startswith("gemini-3"):
-        try:
-            kwargs["thinking_config"] = genai_types.ThinkingConfig(
-                thinking_level=genai_types.ThinkingLevel.LOW
+CLAUDE_PROMPT = """I'm Alex Wavy, a mixing and mastering engineer from Europe who lives in trap, drill, and hip-hop — 5+ years of experience on a hybrid analog/digital setup. You're going to write my cold outreach messages.
+
+I've attached a CSV with the columns: Channel_ID, Artist, Song, Draft Message.
+
+TASK: For every row, write ONE short outreach message in the Draft Message column. Each message gets sent exactly as written — sometimes as an email body, sometimes as an Instagram DM — so it must read naturally as both.
+
+Every message must say, in fresh wording each time:
+- I've been listening to their track (use the Song value) and I genuinely fuck with their sound.
+- I'm Alex Wavy, mix engineer for trap/drill/hip-hop, hybrid analog/digital setup, 5+ years in.
+- The offer: send me a track you're working on, I'll mix it free in a day or two so you can hear what I do.
+- Close simple: if you're down, send something over. No pressure.
+
+HARD RULES:
+- 3 to 5 short sentences, under 60 words. No greeting line, no sign-off, no subject line.
+- Sound like one artist texting another. Direct, casual, respectful. Real recognizes real.
+- BANNED: salesy or corny words ("opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well"), fake flattery, emojis, links, placeholders like [Name].
+- Vary the structure and wording between rows so no two messages look templated.
+- Do NOT change Channel_ID, Artist, or Song. Fill ONLY the Draft Message column.
+
+OUTPUT: Give me back the complete CSV as a downloadable file — same columns, same rows, same order, Draft Message filled for every row. Use proper CSV quoting so commas inside messages don't break the format."""
+
+def merge_message_csv(df, incoming):
+    """Merge Draft Message values from a finished batch CSV back into the leads.
+    Matches by Channel_ID first, then by Artist + Song. Returns (df, updated)."""
+    incoming = incoming.copy()
+    incoming.columns = [str(c).strip() for c in incoming.columns]
+    colmap = {c.lower(): c for c in incoming.columns}
+
+    msg_col = next((colmap[k] for k in ["draft message", "message", "draft_message", "outreach message"] if k in colmap), None)
+    if not msg_col:
+        raise ValueError("Couldn't find a 'Draft Message' column in that CSV.")
+    id_col = colmap.get("channel_id")
+    artist_col = next((colmap[k] for k in ["artist", "cleaned artist"] if k in colmap), None)
+    song_col = next((colmap[k] for k in ["song", "cleaned song"] if k in colmap), None)
+
+    updated = 0
+    for _, r in incoming.iterrows():
+        text = str(r[msg_col]).strip()
+        if not text or text.lower() == "nan":
+            continue
+        mask = None
+        if id_col is not None and is_valid_data(r.get(id_col, "")):
+            mask = df["Channel_ID"].astype(str) == str(r[id_col]).strip()
+        if (mask is None or not mask.any()) and artist_col and song_col:
+            mask = (
+                (df["Cleaned Artist"].astype(str).str.strip().str.lower() == str(r[artist_col]).strip().lower())
+                & (df["Cleaned Song"].astype(str).str.strip().str.lower() == str(r[song_col]).strip().lower())
             )
-        except Exception:
-            pass
-    return genai_types.GenerateContentConfig(**kwargs)
-
-def write_with_gemini(client, model, artist, song):
-    """Returns (text, error). One short message that works as an email or a DM.
-    One API call per artist. Retries with backoff on rate limits."""
-    user_prompt = f"""
-    Write ONE short cold outreach message to an artist named '{artist}' about their track '{song}'.
-    It will be sent exactly as written — sometimes as an email body, sometimes as an Instagram DM — so it must read naturally as both.
-
-    Say, in your own words (never copy this phrasing exactly):
-    - You've been listening to '{song}' and you genuinely fuck with their sound.
-    - You're Alex Wavy, a mix engineer for trap, drill and hip-hop (hybrid analog/digital setup, 5+ years).
-    - The offer: they send a track they're working on, you mix it free in a day or two so they can hear what you do.
-    - Close simple: if they're down, send something over. No pressure.
-
-    HARD RULES:
-    - 3 to 5 short sentences. Under 60 words total. No greeting line, no sign-off, no subject line.
-    - Sound like a real person from the culture texting another artist. Direct and respectful.
-    - BANNED: salesy or corny words ("opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well"), fake flattery, emojis, links, placeholders.
-    - Vary the structure and wording between artists so messages never look templated.
-    """
-
-    sleeps = [3, 8, 20]
-    last_err = None
-    for attempt in range(4):
-        try:
-            response = client.models.generate_content(
-                model=model,
-                contents=user_prompt,
-                config=message_config(model),
-            )
-            text = (response.text or "").strip()
-            if text:
-                return text, None
-            last_err = "Model returned an empty response"
-        except Exception as e:
-            last_err = str(e)
-            msg = last_err.lower()
-            retryable = any(x in msg for x in
-                ["429", "resource_exhausted", "rate", "unavailable", "503", "500", "deadline", "overloaded"])
-            if not retryable:
-                break
-        if attempt < 3:
-            time.sleep(sleeps[attempt])
-    return None, last_err
+        if mask is not None and mask.any():
+            df.loc[mask, "Draft Message"] = text
+            df.loc[mask, "🔄 Regenerate"] = False
+            updated += int(mask.sum())
+    return df, updated
 
 # ----------------------------------------------------------------------------
 # Apify helper
@@ -1043,70 +1042,54 @@ def page_write():
                         flash("success", f"Cleaned names for {cleaned} leads with {model}.")
                     st.rerun()
 
-    # ---- Step 2: Write messages -------------------------------------------
+    # ---- Step 2: Messages via Claude.ai (no API) ---------------------------
     with st.container(border=True):
-        st.subheader("2 · Write messages (Gemini)")
-        st.caption(f"One short message per artist — the same text goes out as the email and the DM. One Gemini call per artist. {len(cleaned_msg_targets)} pending.")
+        st.subheader("2 · Write messages (Claude.ai — no API)")
+        st.caption(f"Export a batch, have Claude.ai write the messages, import the finished CSV back. {len(cleaned_msg_targets)} artists pending.")
         skipped = len(msg_targets) - len(cleaned_msg_targets)
         if skipped:
             st.warning(f"{skipped} artists will be skipped until their names are cleaned in step 1.")
-        st.caption("Tip: tick **🔄 Regenerate** on any row in Leads to rewrite that artist's messages.")
 
-        if st.button("Write messages", type="primary", disabled=(len(cleaned_msg_targets) == 0)):
-            key = get_key("GEMINI_API_KEY")
-            if not key:
-                st.error("Gemini API key is missing. Add it in Settings.")
-            else:
-                try:
-                    gclient2 = google_genai.Client(api_key=key)
-                except Exception as e:
-                    st.error(f"Gemini client failed to start: {e}")
-                    gclient2 = None
-                if gclient2:
-                    progress = st.progress(0.0)
-                    status = st.empty()
-                    status.info("Checking which Gemini model your key can use...")
-                    model = resolve_gemini_model(gclient2)
-                    errors, last_error, written = 0, "", 0
-                    consecutive = 0
-                    total = len(cleaned_msg_targets)
-                    fatal_markers = ["api key", "api_key", "unauthenticated", "permission", "not_found"]
-                    aborted = None
-                    for pos, idx in enumerate(cleaned_msg_targets):
-                        row = st.session_state.df.loc[idx]
-                        artist, song = row["Cleaned Artist"], row["Cleaned Song"]
-                        status.info(f"Writing for {artist}... ({pos + 1}/{total})")
+        if not cleaned_msg_targets:
+            st.info("No artists are waiting for messages. Tick 🔄 on rows in Leads to rewrite them.")
+        else:
+            batch_n = st.number_input(
+                "Artists in this batch",
+                min_value=1,
+                max_value=len(cleaned_msg_targets),
+                value=min(100, len(cleaned_msg_targets)),
+                help="After you import a finished batch, the next download automatically contains whoever is still pending.",
+            )
+            batch_idx = cleaned_msg_targets[: int(batch_n)]
+            batch = st.session_state.df.loc[batch_idx, ["Channel_ID", "Cleaned Artist", "Cleaned Song"]].copy()
+            batch.columns = ["Channel_ID", "Artist", "Song"]
+            batch["Draft Message"] = ""
 
-                        text, err = write_with_gemini(gclient2, model, artist, song)
-                        if text:
-                            st.session_state.df.loc[idx, "Draft Message"] = text
-                            st.session_state.df.loc[idx, "🔄 Regenerate"] = False
-                            written += 1
-                            consecutive = 0
-                        else:
-                            errors += 1
-                            last_error = err
-                            consecutive += 1
+            st.markdown("**Step A — download the batch**")
+            st.download_button(
+                f"📥 Download batch CSV ({len(batch_idx)} artists)",
+                data=batch.to_csv(index=False).encode("utf-8"),
+                file_name="wavy_message_batch.csv",
+                mime="text/csv",
+            )
 
-                        if last_error and any(m in str(last_error).lower() for m in fatal_markers):
-                            aborted = f"Gemini rejected your key or the model, so the run was halted. Check the key in Settings and try again. Error: {last_error}"
-                            break
-                        if consecutive >= 3:
-                            aborted = f"Gemini failed 3 artists in a row, so the run was stopped. Error: {last_error}"
-                            break
-                        progress.progress(min(1.0, (pos + 1) / total))
+            st.markdown("**Step B — copy this prompt into Claude.ai and attach the CSV**")
+            st.code(CLAUDE_PROMPT, language=None, wrap_lines=True)
 
-                    save_db(st.session_state.df)
-                    quota_hit = last_error and any(x in str(last_error).lower() for x in ["resource_exhausted", "quota", "429"])
-                    if aborted and quota_hit:
-                        flash("warning", f"Wrote {written} messages, then hit Gemini's rate/daily limit and stopped. Everything unwritten is still pending — wait a while (or enable billing on your Google AI account for higher limits), then press Write messages to continue where it left off.")
-                    elif aborted:
-                        flash("warning", f"Stopped after writing {written} messages. {aborted}")
-                    elif errors:
-                        flash("warning", f"Wrote {written} messages; {errors} failed and stayed pending for retry. Last error: {last_error}")
-                    else:
-                        flash("success", f"Wrote {written} messages for {total} artists with {model}. They're waiting in Send.")
-                    st.rerun()
+        st.markdown("**Step C — import the finished CSV**")
+        finished = st.file_uploader("Finished batch from Claude.ai", type=["csv"], key="msg_import", label_visibility="collapsed")
+        if finished is not None and st.button("Import messages", type="primary"):
+            try:
+                incoming = pd.read_csv(finished)
+                st.session_state.df, updated = merge_message_csv(st.session_state.df, incoming)
+                save_db(st.session_state.df)
+                if updated:
+                    flash("success", f"Imported {updated} messages. They're waiting in Send.")
+                else:
+                    flash("warning", "That CSV imported, but no rows matched your leads — check that Channel_ID or Artist + Song columns are intact.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not import that CSV: {e}")
 
 # ============================================================================
 # PAGE: Send
