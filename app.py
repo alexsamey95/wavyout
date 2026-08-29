@@ -9,6 +9,7 @@ Artist-AI-Outreach apps.
 
 import io
 import os
+import uuid
 import re
 import json
 import time
@@ -72,7 +73,7 @@ def get_key(name):
 # Schema — one lead table for the whole pipeline
 # ----------------------------------------------------------------------------
 COLUMN_ORDER = [
-    "🗑️ Blacklist", "Reached Out", "Replied", "Reached_Out_Date",
+    "🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Reached_Out_Date",
     "Channel_ID", "Channel Name", "Cleaned Artist", "Cleaned Song",
     "Song Name", "Subscribers", "Email Address", "Instagram", "IG Followers",
     "IG Bio", "Draft Message", "🔄 Regenerate",
@@ -85,7 +86,7 @@ TEXT_DEFAULTS = {
     "IG Bio": "Not Scanned", "Draft Message": "",
     "Channel_URL": "", "Google Search Status": "Not Searched", "🔍 Quick Search": "",
 }
-BOOL_COLS = ["🗑️ Blacklist", "Reached Out", "Replied", "🔄 Regenerate"]
+BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "🔄 Regenerate"]
 INT_COLS = ["Subscribers", "IG Followers"]
 
 def quick_search_url(name):
@@ -156,8 +157,10 @@ def load_db():
             st.warning(f"Could not read {DB_FILE} ({e}). Starting with an empty database.")
     return ensure_schema(pd.DataFrame())
 
+UI_ONLY_COLS = ["🗑️ Blacklist", "❌ Remove"]
+
 def save_db(df):
-    df.drop(columns=["🗑️ Blacklist"], errors="ignore").to_csv(DB_FILE, index=False)
+    df.drop(columns=UI_ONLY_COLS, errors="ignore").to_csv(DB_FILE, index=False)
 
 def load_json_set(filepath):
     # Values are stored as-is: YouTube video/channel IDs are case-sensitive.
@@ -357,24 +360,28 @@ def clean_with_gemini(client, model, channel_name, video_title):
     except Exception as e:
         return str(channel_name).strip(), pre_cleaned, str(e)
 
-CLAUDE_PROMPT = """I'm Alex Wavy, a mixing and mastering engineer from Europe who lives in trap, drill, and hip-hop — 5+ years of experience on a hybrid analog/digital setup. You're going to write my cold outreach messages.
+CLAUDE_PROMPT = """I'm Alex Wavy, a mixing and mastering engineer from Europe specializing in trap, drill, and hip-hop — 5+ years of experience on a hybrid analog/digital setup. You're going to write my cold outreach messages.
 
 I've attached a CSV with the columns: Channel_ID, Artist, Song, Draft Message.
 
-TASK: For every row, write ONE short outreach message in the Draft Message column. Each message gets sent exactly as written — sometimes as an email body, sometimes as an Instagram DM — so it must read naturally as both.
+TASK: For every row, write ONE outreach message in the Draft Message column. Each message gets sent exactly as written — sometimes as an email body, sometimes as an Instagram DM — so it must read naturally as both.
 
-Every message must say, in fresh wording each time:
-- I've been listening to their track (use the Song value) and I genuinely fuck with their sound.
-- I'm Alex Wavy, mix engineer for trap/drill/hip-hop, hybrid analog/digital setup, 5+ years in.
-- The offer: send me a track you're working on, I'll mix it free in a day or two so you can hear what I do.
-- Close simple: if you're down, send something over. No pressure.
+STRUCTURE every message like this, in fresh wording each time:
+1. GREETING with their name: "Hey {Artist}," / "What's up {Artist}," / "Yo {Artist}," — vary it. If the Artist value is clearly a channel name or contains junk, clean it up or greet without a name.
+2. THE HOOK: I listened to {Song} and a few of their other tracks, and I genuinely like their sound. Reference the actual track title naturally — strip any junk like hashtags, director tags, or feature lists when mentioning it.
+3. WHO I AM: Alex Wavy, mixing and mastering engineer specializing in trap, drill, and hip-hop. 5+ years, hybrid analog/digital studio.
+4. THE OFFER — be specific about what to send: they reply with ONE track they're working on (a rough bounce or the session files, whatever they have) and I send back a finished professional mix within 48 hours, completely free.
+5. WHY IT'S FREE — one honest line: no catch, it's how I show new artists what I do. If they like the result we can talk about working together; if not, they keep the mix anyway.
+6. CLEAR CTA + SIGN-OFF: tell them exactly what to do ("just reply with the track") and sign off "– Alex Wavy".
 
-HARD RULES:
-- 3 to 5 short sentences, under 60 words. No greeting line, no sign-off, no subject line.
-- Sound like one artist texting another. Direct, casual, respectful. Real recognizes real.
-- BANNED: salesy or corny words ("opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well"), fake flattery, emojis, links, placeholders like [Name].
+STYLE RULES:
+- 70 to 100 words. Short sentences. Clear and easy to read on a phone.
+- Professional but human — a real engineer reaching out, not a marketing bot and not a try-hard.
+- Keep slang minimal (one casual touch max) and no profanity.
+- BANNED: "opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well", emojis, links, fake flattery.
 - Vary the structure and wording between rows so no two messages look templated.
 - Do NOT change Channel_ID, Artist, or Song. Fill ONLY the Draft Message column.
+- If a row is clearly a media channel rather than an artist, adapt the offer: I'll mix a track free for any artist they work with.
 
 OUTPUT: Give me back the complete CSV as a downloadable file — same columns, same rows, same order, Draft Message filled for every row. Use proper CSV quoting so commas inside messages don't break the format."""
 
@@ -392,7 +399,7 @@ def merge_message_csv(df, incoming):
     artist_col = next((colmap[k] for k in ["artist", "cleaned artist"] if k in colmap), None)
     song_col = next((colmap[k] for k in ["song", "cleaned song"] if k in colmap), None)
 
-    updated = 0
+    updated, skipped = 0, 0
     for _, r in incoming.iterrows():
         text = str(r[msg_col]).strip()
         if not text or text.lower() == "nan":
@@ -409,7 +416,9 @@ def merge_message_csv(df, incoming):
             df.loc[mask, "Draft Message"] = text
             df.loc[mask, "🔄 Regenerate"] = False
             updated += int(mask.sum())
-    return df, updated
+        else:
+            skipped += 1
+    return df, updated, skipped
 
 # ----------------------------------------------------------------------------
 # Apify helper
@@ -460,7 +469,7 @@ MEMORY_FILES = [SEEN_VIDEOS_FILE, BLACKLIST_FILE, SCRAPED_IGS_FILE, SCRAPED_GOOG
 def build_backup_zip(df):
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        z.writestr(DB_FILE, df.drop(columns=["🗑️ Blacklist"], errors="ignore").to_csv(index=False))
+        z.writestr(DB_FILE, df.drop(columns=UI_ONLY_COLS, errors="ignore").to_csv(index=False))
         for f in MEMORY_FILES:
             if os.path.exists(f):
                 z.write(f, arcname=f)
@@ -1081,10 +1090,11 @@ def page_write():
         if finished is not None and st.button("Import messages", type="primary"):
             try:
                 incoming = pd.read_csv(finished)
-                st.session_state.df, updated = merge_message_csv(st.session_state.df, incoming)
+                st.session_state.df, updated, skipped = merge_message_csv(st.session_state.df, incoming)
                 save_db(st.session_state.df)
                 if updated:
-                    flash("success", f"Imported {updated} messages. They're waiting in Send.")
+                    note = f" ({skipped} rows matched no lead and were skipped.)" if skipped else ""
+                    flash("success", f"Imported {updated} messages into your leads database — saved permanently and waiting in Send.{note}")
                 else:
                     flash("warning", "That CSV imported, but no rows matched your leads — check that Channel_ID or Artist + Song columns are intact.")
                 st.rerun()
@@ -1216,8 +1226,39 @@ def page_leads():
     st.title("📋 Leads")
     st.caption("Every artist in one table. Edit cells directly — changes save automatically.")
 
+    with st.expander("➕ Add a lead manually"):
+        with st.form("add_lead", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            new_name = c1.text_input("Artist / channel name (required)")
+            new_song = c2.text_input("Song")
+            c3, c4, c5 = st.columns(3)
+            new_email = c3.text_input("Email")
+            new_ig = c4.text_input("Instagram URL or @handle")
+            new_subs = c5.number_input("Subscribers", min_value=0, value=0)
+            if st.form_submit_button("Add lead"):
+                if not new_name.strip():
+                    st.warning("Name is required.")
+                else:
+                    ig = new_ig.strip()
+                    if ig.startswith("@"):
+                        ig = f"https://instagram.com/{ig[1:]}"
+                    row = {
+                        "Channel_ID": "manual-" + uuid.uuid4().hex[:10],
+                        "Channel Name": new_name.strip(),
+                        "Song Name": new_song.strip() or "Unknown",
+                        "Email Address": new_email.strip() or "None Found",
+                        "Instagram": ig or "None",
+                        "Subscribers": int(new_subs),
+                    }
+                    st.session_state.df = ensure_schema(
+                        pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
+                    )
+                    save_db(st.session_state.df)
+                    flash("success", f"Added {new_name.strip()} to your leads.")
+                    st.rerun()
+
     if st.session_state.df.empty:
-        st.info("No leads yet. Sync a playlist in **Collect** to get started.")
+        st.info("No leads yet. Sync a playlist in **Collect** — or add one manually above.")
         return
 
     search = st.text_input("Search", placeholder="Search by artist or channel name...", label_visibility="collapsed")
@@ -1243,7 +1284,7 @@ def page_leads():
     elif crm_filter == "Contacted": filtered_df = filtered_df[(filtered_df["Reached Out"] == True) & (filtered_df["Replied"] == False)]
     elif crm_filter == "Replied": filtered_df = filtered_df[filtered_df["Replied"] == True]
 
-    st.caption(f"Showing {len(filtered_df)} of {len(st.session_state.df)} artists · amber = contacted · red = follow-up due · green = replied")
+    st.caption(f"Showing {len(filtered_df)} of {len(st.session_state.df)} artists · amber = contacted · red = follow-up due · green = replied · 🗑️ removes AND bans, ❌ just removes")
 
     edited_df = st.data_editor(
         filtered_df.style.apply(highlight_rows, axis=1),
@@ -1251,8 +1292,9 @@ def page_leads():
             "Channel_ID": None,
             "Channel_URL": None,
             "Song Name": None,
-            "Draft Message": None,
-            "🗑️ Blacklist": st.column_config.CheckboxColumn("🗑️", help="Remove and ban this channel."),
+            "Draft Message": st.column_config.TextColumn("Message", width="large", max_chars=2000),
+            "🗑️ Blacklist": st.column_config.CheckboxColumn("🗑️", help="Remove this lead AND ban the channel from future syncs."),
+            "❌ Remove": st.column_config.CheckboxColumn("❌", help="Delete this lead without banning — it can come back on a future sync."),
             "Reached Out": st.column_config.CheckboxColumn("Reached Out"),
             "Replied": st.column_config.CheckboxColumn("Replied"),
             "🔄 Regenerate": st.column_config.CheckboxColumn("🔄", help="Rewrite this artist's messages on the next Write run."),
@@ -1263,7 +1305,7 @@ def page_leads():
             "Cleaned Song": st.column_config.TextColumn("Song"),
             "Google Search Status": st.column_config.TextColumn("Google", disabled=True),
             "IG Bio": st.column_config.TextColumn("IG Bio", max_chars=1000),
-            "🔍 Quick Search": st.column_config.LinkColumn("Find Contacts", display_text="Search web"),
+            "🔍 Quick Search": st.column_config.LinkColumn("Find Contacts", display_text="Search web", disabled=True),
         },
         width="stretch",
         hide_index=True,
@@ -1279,9 +1321,15 @@ def page_leads():
         st.session_state.df = st.session_state.df[~st.session_state.df["Channel_ID"].isin(banned_ids)]
         changes_made = True
 
+    to_remove = edited_df[(edited_df["❌ Remove"] == True) & (edited_df["🗑️ Blacklist"] != True)]
+    removed_ids = to_remove["Channel_ID"].tolist()
+    if removed_ids:
+        st.session_state.df = st.session_state.df[~st.session_state.df["Channel_ID"].isin(removed_ids)]
+        changes_made = True
+
     for idx in edited_df.index:
         ch_id = edited_df.loc[idx, "Channel_ID"]
-        if ch_id in to_delete["Channel_ID"].values:
+        if ch_id in to_delete["Channel_ID"].values or ch_id in removed_ids:
             continue
 
         was_reached = filtered_df.loc[idx, "Reached Out"]
@@ -1298,7 +1346,7 @@ def page_leads():
             elif not is_reached and was_reached:
                 st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Reached_Out_Date"] = pd.NaT
 
-        for col in ["Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "🔄 Regenerate"]:
+        for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "🔄 Regenerate"]:
             old_val = filtered_df.loc[idx, col]
             new_val = edited_df.loc[idx, col]
             if str(old_val) != str(new_val):
@@ -1309,7 +1357,7 @@ def page_leads():
         save_db(st.session_state.df)
         st.rerun()
 
-    export_cols = [c for c in filtered_df.columns if c not in ["Channel_ID", "🗑️ Blacklist", "🔍 Quick Search"]]
+    export_cols = [c for c in filtered_df.columns if c not in ["Channel_ID", "🗑️ Blacklist", "❌ Remove", "🔍 Quick Search"]]
     st.download_button(
         "📥 Download filtered leads (.csv)",
         data=filtered_df[export_cols].to_csv(index=False).encode("utf-8"),
@@ -1391,10 +1439,39 @@ def page_settings():
     with st.container(border=True):
         st.subheader("Blacklist")
         st.write(f"**{len(blacklist)}** channels are banned from future syncs.")
-        if len(blacklist) > 0 and st.button("Clear blacklist (unban all)"):
-            blacklist.clear()
-            save_json_set(blacklist, BLACKLIST_FILE)
-            flash("success", "Blacklist cleared.")
+        if len(blacklist) > 0:
+            to_unban = st.multiselect("Unban specific channels", sorted(blacklist))
+            c1, c2 = st.columns(2)
+            if c1.button("Unban selected", disabled=(not to_unban)):
+                for b in to_unban:
+                    blacklist.discard(b)
+                save_json_set(blacklist, BLACKLIST_FILE)
+                flash("success", f"Unbanned {len(to_unban)} channel(s) — they can return on the next sync.")
+                st.rerun()
+            if c2.button("Clear blacklist (unban all)"):
+                blacklist.clear()
+                save_json_set(blacklist, BLACKLIST_FILE)
+                flash("success", "Blacklist cleared.")
+                st.rerun()
+
+    with st.container(border=True):
+        st.subheader("Scrape memory")
+        st.caption("These lists stop the app from re-processing what it already handled. Forget one to run it again. Note: leads that already hold scraped data still won't re-scrape unless you also clear their IG Bio / Google status cells in Leads.")
+        m1, m2, m3 = st.columns(3)
+        if m1.button(f"Forget seen videos ({len(seen_videos)})"):
+            seen_videos.clear()
+            save_json_set(seen_videos, SEEN_VIDEOS_FILE)
+            flash("success", "Seen-video memory cleared — the next sync rescans the whole playlist.")
+            st.rerun()
+        if m2.button(f"Forget IG scrapes ({len(scraped_igs)})"):
+            scraped_igs.clear()
+            save_json_set(scraped_igs, SCRAPED_IGS_FILE)
+            flash("success", "Instagram scrape memory cleared.")
+            st.rerun()
+        if m3.button(f"Forget Google searches ({len(scraped_googles)})"):
+            scraped_googles.clear()
+            save_json_set(scraped_googles, SCRAPED_GOOGLES_FILE)
+            flash("success", "Google search memory cleared.")
             st.rerun()
 
     # ---- Danger zone --------------------------------------------------------
