@@ -1060,7 +1060,7 @@ def page_write():
             st.warning(f"{skipped} artists will be skipped until their names are cleaned in step 1.")
 
         if not cleaned_msg_targets:
-            st.info("No artists are waiting for messages. Tick 🔄 on rows in Leads to rewrite them.")
+            st.info("No artists are waiting for messages right now — tick 🔄 on rows in Leads to rewrite them, and the batch download will reappear here.")
         else:
             batch_n = st.number_input(
                 "Artists in this batch",
@@ -1082,8 +1082,8 @@ def page_write():
                 mime="text/csv",
             )
 
-            st.markdown("**Step B — copy this prompt into Claude.ai and attach the CSV**")
-            st.code(CLAUDE_PROMPT, language=None, wrap_lines=True)
+        st.markdown("**Step B — copy this prompt into Claude.ai and attach the CSV**")
+        st.code(CLAUDE_PROMPT, language=None, wrap_lines=True)
 
         st.markdown("**Step C — import the finished CSV**")
         finished = st.file_uploader("Finished batch from Claude.ai", type=["csv"], key="msg_import", label_visibility="collapsed")
