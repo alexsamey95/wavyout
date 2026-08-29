@@ -1,0 +1,6 @@
+streamlit
+pandas
+google-api-python-client
+apify-client
+google-genai>=1.0.0
+anthropic>=0.45.0
