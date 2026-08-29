@@ -81,7 +81,7 @@ def get_key(name):
 # Schema — one lead table for the whole pipeline
 # ----------------------------------------------------------------------------
 COLUMN_ORDER = [
-    "🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Reached_Out_Date",
+    "🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Reached_Out_Date", "Mix_Date", "Paid_Date", "Added_Date",
     "Channel_ID", "Channel Name", "Cleaned Artist", "Cleaned Song",
     "Song Name", "Subscribers", "Email Address", "Instagram", "IG Followers",
     "IG Bio", "Draft Message", "🔄 Regenerate",
@@ -141,9 +141,10 @@ def ensure_schema(df):
         df["Revenue"] = 0.0
     df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
 
-    if "Reached_Out_Date" not in df.columns:
-        df["Reached_Out_Date"] = pd.NaT
-    df["Reached_Out_Date"] = pd.to_datetime(df["Reached_Out_Date"], errors="coerce")
+    for dcol in ["Reached_Out_Date", "Mix_Date", "Paid_Date", "Added_Date"]:
+        if dcol not in df.columns:
+            df[dcol] = pd.NaT
+        df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
 
     # Old "[Claude Error]" strings must never block regeneration
     df["Draft Message"] = df["Draft Message"].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
@@ -673,69 +674,98 @@ td.money{color:#EFC94C;font-family:'Space Grotesk',sans-serif;font-weight:700;}
 .foot{margin-top:44px;font-family:'IBM Plex Mono',monospace;font-size:11px;color:#5b616c;letter-spacing:.1em;text-transform:uppercase;}
 """
 
-def build_report_html(df):
-    stats = pipeline_stats(df)
+def build_report_html(df, start=None, end=None, period_label="All time"):
     now = pd.Timestamp.now()
+    ranged = start is not None
 
     def pct(a, b):
         return "—" if not b else f"{a / b * 100:.0f}%"
 
-    contacted_dates = pd.to_datetime(df["Reached_Out_Date"], errors="coerce") if not df.empty else pd.Series(dtype="datetime64[ns]")
-    c7 = int((contacted_dates >= now - pd.Timedelta(days=7)).sum()) if not df.empty else 0
-    c30 = int((contacted_dates >= now - pd.Timedelta(days=30)).sum()) if not df.empty else 0
-    due = len(follow_ups_due(df)) if not df.empty else 0
-    avg_client = f"${stats['revenue'] / stats['paid']:,.0f}" if stats["paid"] else "—"
-    rev_per_contact = f"${stats['revenue'] / stats['contacted']:,.2f}" if stats["contacted"] else "—"
+    if ranged:
+        dates = pd.to_datetime(df["Reached_Out_Date"], errors="coerce")
+        cohort = df[(dates >= start) & (dates <= end)] if not df.empty else df
+        subtitle = f"Cohort: artists contacted {period_label} · outcomes to date"
+        contacted = len(cohort)
+        replied = int(cohort["Replied"].sum()) if contacted else 0
+        free_mix = int(cohort["Free Mix Sent"].sum()) if contacted else 0
+        paid = int(cohort["Paid Customer"].sum()) if contacted else 0
+        revenue = float(cohort["Revenue"].sum()) if contacted else 0.0
+        stages = [("Contacted", contacted), ("Replied", replied), ("Free Mix", free_mix), ("Paid", paid)]
+        base = contacted
+        clients_src = cohort
 
-    stages = [("Leads", stats["total"]), ("Contactable", stats["contactable"]), ("Drafted", stats["drafted"]),
-              ("Contacted", stats["contacted"]), ("Replied", stats["replied"]),
-              ("Free Mix", stats["free_mix"]), ("Paid", stats["paid"])]
+        mix_dates = pd.to_datetime(df["Mix_Date"], errors="coerce")
+        paid_dates = pd.to_datetime(df["Paid_Date"], errors="coerce")
+        mixes_in_period = int(((mix_dates >= start) & (mix_dates <= end)).sum())
+        closed_in_period = int(((paid_dates >= start) & (paid_dates <= end)).sum())
+        activity = [("Contacted in period", contacted),
+                    ("Mixes delivered in period", mixes_in_period),
+                    ("New paying clients", closed_in_period)]
+    else:
+        stats = pipeline_stats(df)
+        subtitle = "All time"
+        contacted, replied = stats["contacted"], stats["replied"]
+        free_mix, paid, revenue = stats["free_mix"], stats["paid"], stats["revenue"]
+        stages = [("Leads", stats["total"]), ("Contactable", stats["contactable"]), ("Drafted", stats["drafted"]),
+                  ("Contacted", contacted), ("Replied", replied), ("Free Mix", free_mix), ("Paid", paid)]
+        base = stats["total"]
+        clients_src = df
+
+        contacted_dates = pd.to_datetime(df["Reached_Out_Date"], errors="coerce") if not df.empty else pd.Series(dtype="datetime64[ns]")
+        c7 = int((contacted_dates >= now - pd.Timedelta(days=7)).sum()) if not df.empty else 0
+        c30 = int((contacted_dates >= now - pd.Timedelta(days=30)).sum()) if not df.empty else 0
+        due = len(follow_ups_due(df)) if not df.empty else 0
+        activity = [("Contacted · 7 days", c7), ("Contacted · 30 days", c30), ("Follow-ups due", due)]
+
+    avg_client = f"${revenue / paid:,.0f}" if paid else "—"
+    rev_per_contact = f"${revenue / contacted:,.2f}" if contacted else "—"
+
     funnel = ""
     for label, count in stages:
         hi, lo = STAGE_COLORS.get(label, (ACCENT, "#7A5210"))
-        width = 0 if stats["total"] == 0 or count == 0 else max(2, round(100 * count / stats["total"]))
-        share = pct(count, stats["total"])
+        width = 0 if base == 0 or count == 0 else max(2, round(100 * count / base))
         funnel += (f'<div class="frow"><div class="fl">{label}</div>'
                    f'<div class="bar"><div class="fill" style="width:{width}%;background:linear-gradient(90deg,{lo},{hi});"></div></div>'
-                   f'<div class="fc">{count} · {share}</div></div>')
+                   f'<div class="fc">{count} · {pct(count, base)}</div></div>')
 
     clients_rows = ""
-    if not df.empty and df["Paid Customer"].any():
-        top = df[df["Paid Customer"]].sort_values("Revenue", ascending=False).head(15)
+    if not clients_src.empty and clients_src["Paid Customer"].any():
+        top = clients_src[clients_src["Paid Customer"]].sort_values("Revenue", ascending=False).head(15)
         for _, r in top.iterrows():
             name = html_escape.escape(display_name(r))
             mix = "✓" if r.get("Free Mix Sent", False) else "—"
             clients_rows += f'<tr><td>{name}</td><td>{mix}</td><td class="money">${float(r["Revenue"]):,.0f}</td></tr>'
     else:
-        clients_rows = '<tr><td colspan="3" style="color:#9AA3B2;">No paying clients yet — they land here.</td></tr>'
+        clients_rows = '<tr><td colspan="3" style="color:#9AA3B2;">No paying clients in this period yet.</td></tr>'
+
+    activity_cards = "".join(
+        f'<div class="card"><div class="v">{v}</div><div class="l">{l}</div></div>' for l, v in activity
+    )
 
     return f"""<!DOCTYPE html><html><head><meta charset="utf-8">
 <title>WavyMixing — Outreach Report {now:%Y-%m-%d}</title>
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=Inter:wght@400;500&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>{REPORT_CSS}</style></head><body><div class="wrap">
-<div class="eyebrow">WAVYMIXING · OUTREACH REPORT · {now:%b %d, %Y}</div>
+<div class="eyebrow">WAVYMIXING · OUTREACH REPORT · {period_label.upper()} · {now:%b %d, %Y}</div>
 <h1>Pipeline Report</h1>
+<div class="eyebrow" style="margin:-16px 0 24px;">{subtitle}</div>
 <div class="cards">
-  <div class="card"><div class="v" style="color:#EFC94C;">${stats["revenue"]:,.0f}</div><div class="l">Revenue</div></div>
-  <div class="card"><div class="v">{stats["paid"]}</div><div class="l">Paying clients</div></div>
+  <div class="card"><div class="v" style="color:#EFC94C;">${revenue:,.0f}</div><div class="l">Revenue</div></div>
+  <div class="card"><div class="v">{paid}</div><div class="l">Paying clients</div></div>
   <div class="card"><div class="v">{avg_client}</div><div class="l">Avg per client</div></div>
-  <div class="card"><div class="v">{stats["free_mix"]}</div><div class="l">Free mixes done</div></div>
+  <div class="card"><div class="v">{free_mix}</div><div class="l">Free mixes done</div></div>
 </div>
 <h2>Funnel</h2>
 {funnel}
 <h2>Conversion rates</h2>
 <div class="cards">
-  <div class="card"><div class="v">{pct(stats["replied"], stats["contacted"])}</div><div class="l">Reply rate</div></div>
-  <div class="card"><div class="v">{pct(stats["free_mix"], stats["replied"])}</div><div class="l">Replies → mixes</div></div>
-  <div class="card"><div class="v">{pct(stats["paid"], stats["free_mix"])}</div><div class="l">Mixes → paid</div></div>
+  <div class="card"><div class="v">{pct(replied, contacted)}</div><div class="l">Reply rate</div></div>
+  <div class="card"><div class="v">{pct(free_mix, replied)}</div><div class="l">Replies → mixes</div></div>
+  <div class="card"><div class="v">{pct(paid, free_mix)}</div><div class="l">Mixes → paid</div></div>
   <div class="card"><div class="v">{rev_per_contact}</div><div class="l">Revenue / contact</div></div>
 </div>
 <h2>Activity</h2>
-<div class="cards">
-  <div class="card"><div class="v">{c7}</div><div class="l">Contacted · 7 days</div></div>
-  <div class="card"><div class="v">{c30}</div><div class="l">Contacted · 30 days</div></div>
-  <div class="card"><div class="v">{due}</div><div class="l">Follow-ups due</div></div>
-</div>
+<div class="cards">{activity_cards}</div>
 <h2>Paying clients</h2>
 <table><tr><th>Artist</th><th>Free mix</th><th>Revenue</th></tr>{clients_rows}</table>
 <div class="foot">Generated by Wavy Outreach · wavymixing.com</div>
@@ -817,13 +847,37 @@ def page_dashboard():
     with m3, st.container(border=True):
         st.metric("Follow-ups due", len(due))
 
-    st.download_button(
-        "📄 Download CRM report (.html)",
-        data=build_report_html(df).encode("utf-8"),
-        file_name=f"wavymixing_outreach_report_{pd.Timestamp.now():%Y-%m-%d}.html",
-        mime="text/html",
-        help="A self-contained report of your funnel, revenue, and conversion rates — opens in any browser.",
-    )
+    with st.container(border=True):
+        rc1, rc2, rc3 = st.columns([2, 3, 2], vertical_alignment="bottom")
+        with rc1:
+            period = st.selectbox(
+                "📄 CRM report period",
+                ["All time", "Last 7 days", "Last 30 days", "Last 90 days", "Last year", "Custom range"],
+                key="report_period",
+            )
+        start = end = None
+        label = period.lower() if period != "All time" else "All time"
+        if period == "Custom range":
+            with rc2:
+                d1, d2 = st.columns(2)
+                start_d = d1.date_input("From", value=pd.Timestamp.now().date() - pd.Timedelta(days=30), key="rep_from")
+                end_d = d2.date_input("To", value=pd.Timestamp.now().date(), key="rep_to")
+            start = pd.Timestamp(start_d)
+            end = pd.Timestamp(end_d) + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+            label = f"{start_d:%b %d} – {end_d:%b %d, %Y}"
+        elif period != "All time":
+            days = {"Last 7 days": 7, "Last 30 days": 30, "Last 90 days": 90, "Last year": 365}[period]
+            start = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+            end = pd.Timestamp.now()
+        slug = period.lower().replace(" ", "-")
+        with rc3:
+            st.download_button(
+                "Download report",
+                data=build_report_html(df, start, end, label).encode("utf-8"),
+                file_name=f"wavymixing_report_{slug}_{pd.Timestamp.now():%Y-%m-%d}.html",
+                mime="text/html",
+                width="stretch",
+            )
 
     # Next actions, computed from the data
     st.subheader("Next up")
@@ -1004,6 +1058,7 @@ def sync_playlist(playlist_input, yt_key):
                         "Instagram": extract_instagram(full_text),
                         "Channel_URL": channel_url,
                         "🔍 Quick Search": quick_search_url(channel_name),
+                        "Added_Date": pd.Timestamp.now().normalize(),
                     })
         except Exception as e:
             st.error(f"Could not fetch channel details: {e}")
@@ -1441,6 +1496,7 @@ def page_leads():
                         "Email Address": new_email.strip() or "None Found",
                         "Instagram": ig or "None",
                         "Subscribers": int(new_subs),
+                        "Added_Date": pd.Timestamp.now().normalize(),
                     }
                     st.session_state.df = ensure_schema(
                         pd.concat([st.session_state.df, pd.DataFrame([row])], ignore_index=True)
@@ -1496,6 +1552,9 @@ def page_leads():
             "Revenue": st.column_config.NumberColumn("Revenue $", min_value=0, step=10, format="$%d", help="Total earned from this artist — update it every time they pay."),
             "🔄 Regenerate": st.column_config.CheckboxColumn("🔄", help="Rewrite this artist's messages on the next Write run."),
             "Reached_Out_Date": st.column_config.DateColumn("Contacted", disabled=True, format="MMM DD, YYYY"),
+            "Mix_Date": None,
+            "Paid_Date": None,
+            "Added_Date": None,
             "Subscribers": st.column_config.NumberColumn("Subs", format="%d"),
             "IG Followers": st.column_config.NumberColumn("IG Followers", format="%d"),
             "Cleaned Artist": st.column_config.TextColumn("Artist"),
@@ -1543,7 +1602,17 @@ def page_leads():
             elif not is_reached and was_reached:
                 st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Reached_Out_Date"] = pd.NaT
 
-        for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "Free Mix Sent", "Paid Customer", "Revenue", "🔄 Regenerate"]:
+        for flag_col, date_col in [("Free Mix Sent", "Mix_Date"), ("Paid Customer", "Paid_Date")]:
+            was_f = filtered_df.loc[idx, flag_col]
+            is_f = edited_df.loc[idx, flag_col]
+            if is_f != was_f:
+                changes_made = True
+                st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, flag_col] = is_f
+                st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, date_col] = (
+                    pd.Timestamp.now().normalize() if is_f else pd.NaT
+                )
+
+        for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "Revenue", "🔄 Regenerate"]:
             old_val = filtered_df.loc[idx, col]
             new_val = edited_df.loc[idx, col]
             if str(old_val) != str(new_val):
