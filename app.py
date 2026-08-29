@@ -7,10 +7,12 @@ single database. Replaces the separate youtube-artist-scraper and
 Artist-AI-Outreach apps.
 """
 
+import io
 import os
 import re
 import json
 import time
+import zipfile
 from urllib.parse import quote
 
 import pandas as pd
@@ -18,8 +20,6 @@ import streamlit as st
 
 from google import genai as google_genai
 from google.genai import types as genai_types
-import anthropic
-from anthropic import Anthropic
 
 # ----------------------------------------------------------------------------
 # App config
@@ -42,8 +42,7 @@ LAST_PLAYLIST_FILE = "last_playlist.txt"
 SCRAPED_IGS_FILE = "scraped_igs.json"
 SCRAPED_GOOGLES_FILE = "scraped_googles.json"
 
-CLAUDE_MODEL = "claude-haiku-4-5-20251001"
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"  # auto-falls back via resolve_gemini_model if retired
 APIFY_POLL_TIMEOUT_SECS = 15 * 60
 FOLLOW_UP_DAYS = 7
 
@@ -54,7 +53,6 @@ KEY_NAMES = {
     "YOUTUBE_API_KEY": "YouTube",
     "APIFY_API_TOKEN": "Apify",
     "GEMINI_API_KEY": "Gemini",
-    "ANTHROPIC_API_KEY": "Anthropic",
 }
 
 def get_secret(name):
@@ -267,7 +265,54 @@ TONE RULES:
 - DO NOT use emojis.
 - DO NOT include subject lines or placeholder brackets like [Your Name] in the output, just the raw body text."""
 
-def clean_with_gemini(client, channel_name, video_title):
+def resolve_gemini_model(client):
+    """Pick a Gemini model that actually works on this account.
+
+    Google retires model names regularly (1.5 -> 2.5 -> 3.x). Try the preferred
+    model first; if it's gone, discover a current Flash model from the API's
+    own model list. The result is cached for the session."""
+    cached = st.session_state.get("_gemini_model")
+    if cached:
+        return cached
+
+    candidates = [GEMINI_MODEL]
+    try:
+        discovered = []
+        for m in client.models.list():
+            name = (getattr(m, "name", "") or "").split("/")[-1]
+            if "flash" in name and not any(x in name for x in
+                    ["image", "live", "tts", "audio", "embedding", "lite", "veo", "nano"]):
+                discovered.append(name)
+        candidates += sorted(set(discovered) - set(candidates), reverse=True)
+    except Exception:
+        pass
+
+    for cand in candidates:
+        try:
+            client.models.generate_content(model=cand, contents="ok")
+            st.session_state["_gemini_model"] = cand
+            return cand
+        except Exception as e:
+            msg = str(e).lower()
+            if "quota" in msg or "exhaust" in msg or "rate" in msg:
+                # Model exists — the account just hit a limit. Use it anyway.
+                st.session_state["_gemini_model"] = cand
+                return cand
+            continue
+    return GEMINI_MODEL
+
+def gemini_config(model):
+    kwargs = {"response_mime_type": "application/json"}
+    if str(model).startswith("gemini-3"):
+        try:
+            kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=genai_types.ThinkingLevel.LOW  # fast + cheap for extraction
+            )
+        except Exception:
+            pass
+    return genai_types.GenerateContentConfig(**kwargs)
+
+def clean_with_gemini(client, model, channel_name, video_title):
     """Returns (artist, song, error). Error is None on success."""
     pre_cleaned = aggressive_regex_clean(channel_name, video_title)
     prompt = f"""
@@ -284,12 +329,9 @@ def clean_with_gemini(client, channel_name, video_title):
     """
     try:
         response = client.models.generate_content(
-            model=GEMINI_MODEL,
+            model=model,
             contents=prompt,
-            config=genai_types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0,
-            ),
+            config=gemini_config(model),
         )
         text = (response.text or "").strip()
         if text.startswith("```"):
@@ -303,8 +345,20 @@ def clean_with_gemini(client, channel_name, video_title):
     except Exception as e:
         return str(channel_name).strip(), pre_cleaned, str(e)
 
-def write_with_claude(client, artist, song, msg_type):
-    """Returns (text, error). Error is None on success. Retries on rate limits."""
+def message_config(model):
+    kwargs = {"system_instruction": ALEX_WAVY_PERSONA}
+    if str(model).startswith("gemini-3"):
+        try:
+            kwargs["thinking_config"] = genai_types.ThinkingConfig(
+                thinking_level=genai_types.ThinkingLevel.LOW
+            )
+        except Exception:
+            pass
+    return genai_types.GenerateContentConfig(**kwargs)
+
+def write_with_gemini(client, model, artist, song, msg_type):
+    """Returns (text, error). Error is None on success.
+    Retries with backoff on rate limits — important on Gemini's free tier."""
     if msg_type == "email":
         user_prompt = f"""
         I am doing cold outreach to an artist named '{artist}'. I just listened to their track '{song}'.
@@ -316,7 +370,6 @@ def write_with_claude(client, artist, song, msg_type):
         - Offer a free sample to show my creative process and what I can do for them.
         - Call to action: Ask if they are interested, tell them to send a project they are working on, and promise to get it mixed in a day or 2 for free.
         """
-        max_tokens = 600
     else:
         user_prompt = f"""
         I am doing cold outreach to an artist named '{artist}'. I just listened to their track '{song}'.
@@ -328,34 +381,29 @@ def write_with_claude(client, artist, song, msg_type):
         - Offer to mix a track for free in 1-2 days to show them what I can do.
         - Keep it punchy and direct.
         """
-        max_tokens = 300
 
+    sleeps = [3, 8, 20]
     last_err = None
-    for attempt in range(3):
+    for attempt in range(4):
         try:
-            response = client.messages.create(
-                model=CLAUDE_MODEL,
-                max_tokens=max_tokens,
-                system=ALEX_WAVY_PERSONA,
-                messages=[{"role": "user", "content": user_prompt}],
+            response = client.models.generate_content(
+                model=model,
+                contents=user_prompt,
+                config=message_config(model),
             )
-            parts = [b.text for b in response.content if getattr(b, "type", "") == "text"]
-            text = "\n".join(parts).strip()
+            text = (response.text or "").strip()
             if text:
                 return text, None
             last_err = "Model returned an empty response"
-        except anthropic.RateLimitError as e:
-            last_err = f"Rate limited: {e}"
-            time.sleep(2 * (2 ** attempt))
-        except anthropic.APIStatusError as e:
-            last_err = str(e)
-            if e.status_code in (429, 500, 529):
-                time.sleep(2 * (2 ** attempt))
-            else:
-                break
         except Exception as e:
             last_err = str(e)
-            break
+            msg = last_err.lower()
+            retryable = any(x in msg for x in
+                ["429", "resource_exhausted", "rate", "unavailable", "503", "500", "deadline", "overloaded"])
+            if not retryable:
+                break
+        if attempt < 3:
+            time.sleep(sleeps[attempt])
     return None, last_err
 
 # ----------------------------------------------------------------------------
@@ -400,6 +448,36 @@ def run_apify_and_poll(client, actor_id, run_input, total_targets, progress_bar,
     return status, dataset_id
 
 # ----------------------------------------------------------------------------
+# Backup: one ZIP with the leads plus every memory file
+# ----------------------------------------------------------------------------
+MEMORY_FILES = [SEEN_VIDEOS_FILE, BLACKLIST_FILE, SCRAPED_IGS_FILE, SCRAPED_GOOGLES_FILE, LAST_PLAYLIST_FILE]
+
+def build_backup_zip(df):
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr(DB_FILE, df.drop(columns=["🗑️ Blacklist"], errors="ignore").to_csv(index=False))
+        for f in MEMORY_FILES:
+            if os.path.exists(f):
+                z.write(f, arcname=f)
+    return buf.getvalue()
+
+def restore_memory_from_zip(z, replace):
+    """Restore the JSON memory files from a backup ZIP.
+    Replace mode overwrites; merge mode unions with what's already there."""
+    names = set(z.namelist())
+    for f in [SEEN_VIDEOS_FILE, BLACKLIST_FILE, SCRAPED_IGS_FILE, SCRAPED_GOOGLES_FILE]:
+        if f in names:
+            try:
+                incoming = set(str(i) for i in json.loads(z.read(f).decode("utf-8")))
+            except Exception:
+                continue
+            merged = incoming if replace else (load_json_set(f) | incoming)
+            save_json_set(merged, f)
+    if LAST_PLAYLIST_FILE in names and (replace or not os.path.exists(LAST_PLAYLIST_FILE)):
+        with open(LAST_PLAYLIST_FILE, "wb") as out:
+            out.write(z.read(LAST_PLAYLIST_FILE))
+
+# ----------------------------------------------------------------------------
 # Flash messages that survive st.rerun()
 # ----------------------------------------------------------------------------
 def flash(level, msg):
@@ -413,6 +491,14 @@ def show_flash():
 # ----------------------------------------------------------------------------
 # Pipeline stats
 # ----------------------------------------------------------------------------
+def ig_already_scanned(row):
+    """True if this row's IG was already scraped — judged from the data itself,
+    so dedupe survives even if the memory files are lost to a restart."""
+    return str(row.get("IG Bio", "")).strip().lower() not in ["not scanned", "", "nan"]
+
+def google_already_searched(row):
+    return str(row.get("Google Search Status", "")).strip().lower().startswith("searched")
+
 def has_any_draft(row):
     return bool(str(row.get("Draft Email", "")).strip()) or bool(str(row.get("Draft DM", "")).strip())
 
@@ -451,10 +537,12 @@ def enrich_targets(df, scraped_igs, scraped_googles):
         ig_val = str(row["Instagram"])
         if is_valid_data(ig_val):
             if (not is_valid_data(row["Email Address"]) or safe_int(row["IG Followers"]) <= 0) \
+               and not ig_already_scanned(row) \
                and ig_val.split(",")[0].strip().rstrip("/").lower() not in scraped_igs:
                 ig_pending += 1
         else:
-            if str(row["Channel Name"]).strip().lower() not in scraped_googles:
+            if not google_already_searched(row) \
+               and str(row["Channel Name"]).strip().lower() not in scraped_googles:
                 google_pending += 1
     return ig_pending, google_pending
 
@@ -747,7 +835,8 @@ def scrape_instagram():
 
     for idx in df.index:
         ig_val = str(df.loc[idx, "Instagram"])
-        if is_valid_data(ig_val) and (not is_valid_data(df.loc[idx, "Email Address"]) or safe_int(df.loc[idx, "IG Followers"]) <= 0):
+        if is_valid_data(ig_val) and not ig_already_scanned(df.loc[idx]) \
+           and (not is_valid_data(df.loc[idx, "Email Address"]) or safe_int(df.loc[idx, "IG Followers"]) <= 0):
             ig_url = ig_val.split(",")[0].strip().rstrip("/")
             ig_url_lower = ig_url.lower()
             if ig_url_lower not in scraped_igs:
@@ -820,7 +909,7 @@ def scrape_google():
         ig_val = str(df.loc[idx, "Instagram"])
         channel_name = str(df.loc[idx, "Channel Name"]).strip()
         channel_lower = channel_name.lower()
-        if not is_valid_data(ig_val) and channel_lower not in scraped_googles:
+        if not is_valid_data(ig_val) and not google_already_searched(df.loc[idx]) and channel_lower not in scraped_googles:
             search_query = f'"{channel_name}" "instagram.com"'
             query_lower = search_query.lower()
             query_no_quotes = query_lower.replace('"', '')
@@ -902,7 +991,12 @@ def page_write():
     with st.container(border=True):
         st.subheader("1 · Clean names (Gemini)")
         st.caption(f"Turns \"Lil X - Song (Official Video)\" into a clean artist + song. {len(clean_targets)} leads pending.")
-        if st.button("Clean names", disabled=(len(clean_targets) == 0)):
+        reclean_all = st.checkbox(
+            "Re-clean every lead (overwrite existing names)",
+            help="Use after a failed run or a model upgrade to redo names that were already filled in.",
+        )
+        run_targets = list(df.index) if reclean_all else clean_targets
+        if st.button(f"Clean names ({len(run_targets)})", disabled=(len(run_targets) == 0)):
             key = get_key("GEMINI_API_KEY")
             if not key:
                 st.error("Gemini API key is missing. Add it in Settings.")
@@ -915,28 +1009,41 @@ def page_write():
                 if gclient:
                     progress = st.progress(0.0)
                     status = st.empty()
-                    errors, last_error = 0, ""
-                    total = len(clean_targets)
-                    for pos, idx in enumerate(clean_targets):
+                    status.info("Checking which Gemini model your key can use...")
+                    model = resolve_gemini_model(gclient)
+                    errors, last_error, cleaned, consecutive = 0, "", 0, 0
+                    total = len(run_targets)
+                    aborted = False
+                    for pos, idx in enumerate(run_targets):
                         row = st.session_state.df.loc[idx]
                         status.info(f"Cleaning {row['Channel Name']}... ({pos + 1}/{total})")
-                        artist, song, err = clean_with_gemini(gclient, row["Channel Name"], row["Song Name"])
-                        st.session_state.df.loc[idx, "Cleaned Artist"] = artist
-                        st.session_state.df.loc[idx, "Cleaned Song"] = song
+                        artist, song, err = clean_with_gemini(gclient, model, row["Channel Name"], row["Song Name"])
                         if err:
+                            # Leave the row untouched so it stays pending for retry
                             errors += 1
                             last_error = err
+                            consecutive += 1
+                            if consecutive >= 3:
+                                aborted = True
+                                break
+                        else:
+                            consecutive = 0
+                            cleaned += 1
+                            st.session_state.df.loc[idx, "Cleaned Artist"] = artist
+                            st.session_state.df.loc[idx, "Cleaned Song"] = song
                         progress.progress(min(1.0, (pos + 1) / total))
                     save_db(st.session_state.df)
-                    if errors:
-                        flash("warning", f"Cleaned {total} leads, but Gemini failed on {errors} — those used the regex fallback. Last error: {last_error}")
+                    if aborted:
+                        flash("warning", f"Stopped early: Gemini failed 3 times in a row, so the remaining {total - pos - 1} leads weren't attempted. Nothing was overwritten — fix the issue and run again. Last error: {last_error}")
+                    elif errors:
+                        flash("warning", f"Cleaned {cleaned} leads; {errors} failed and stayed pending for retry. Last error: {last_error}")
                     else:
-                        flash("success", f"Cleaned names for {total} leads.")
+                        flash("success", f"Cleaned names for {cleaned} leads with {model}.")
                     st.rerun()
 
     # ---- Step 2: Write messages -------------------------------------------
     with st.container(border=True):
-        st.subheader("2 · Write messages (Claude)")
+        st.subheader("2 · Write messages (Gemini)")
         st.caption(f"Drafts an email for leads with an email address and a DM for leads with an Instagram. {len(cleaned_msg_targets)} artists pending.")
         skipped = len(msg_targets) - len(cleaned_msg_targets)
         if skipped:
@@ -944,46 +1051,75 @@ def page_write():
         st.caption("Tip: tick **🔄 Regenerate** on any row in Leads to rewrite that artist's messages.")
 
         if st.button("Write messages", type="primary", disabled=(len(cleaned_msg_targets) == 0)):
-            key = get_key("ANTHROPIC_API_KEY")
+            key = get_key("GEMINI_API_KEY")
             if not key:
-                st.error("Anthropic API key is missing. Add it in Settings.")
+                st.error("Gemini API key is missing. Add it in Settings.")
             else:
-                cclient = Anthropic(api_key=key)
-                progress = st.progress(0.0)
-                status = st.empty()
-                errors, last_error, written = 0, "", 0
-                total = len(cleaned_msg_targets)
-                for pos, (idx, needs_email, needs_dm) in enumerate(cleaned_msg_targets):
-                    row = st.session_state.df.loc[idx]
-                    artist, song = row["Cleaned Artist"], row["Cleaned Song"]
-                    status.info(f"Writing for {artist}... ({pos + 1}/{total})")
+                try:
+                    gclient2 = google_genai.Client(api_key=key)
+                except Exception as e:
+                    st.error(f"Gemini client failed to start: {e}")
+                    gclient2 = None
+                if gclient2:
+                    progress = st.progress(0.0)
+                    status = st.empty()
+                    status.info("Checking which Gemini model your key can use...")
+                    model = resolve_gemini_model(gclient2)
+                    errors, last_error, written = 0, "", 0
+                    consecutive = 0
+                    total = len(cleaned_msg_targets)
+                    fatal_markers = ["api key", "api_key", "unauthenticated", "permission", "not_found"]
+                    aborted = None
+                    for pos, (idx, needs_email, needs_dm) in enumerate(cleaned_msg_targets):
+                        row = st.session_state.df.loc[idx]
+                        artist, song = row["Cleaned Artist"], row["Cleaned Song"]
+                        status.info(f"Writing for {artist}... ({pos + 1}/{total})")
 
-                    if needs_email:
-                        text, err = write_with_claude(cclient, artist, song, "email")
-                        if text:
-                            st.session_state.df.loc[idx, "Draft Email"] = text
-                            written += 1
-                        else:
-                            errors += 1
-                            last_error = err
-                    if needs_dm:
-                        text, err = write_with_claude(cclient, artist, song, "dm")
-                        if text:
-                            st.session_state.df.loc[idx, "Draft DM"] = text
-                            written += 1
-                        else:
-                            errors += 1
-                            last_error = err
+                        row_failed = False
+                        if needs_email:
+                            text, err = write_with_gemini(gclient2, model, artist, song, "email")
+                            if text:
+                                st.session_state.df.loc[idx, "Draft Email"] = text
+                                written += 1
+                            else:
+                                errors += 1
+                                last_error = err
+                                row_failed = True
+                        fatal_now = last_error and any(m in str(last_error).lower() for m in fatal_markers)
+                        if needs_dm and not fatal_now:
+                            text, err = write_with_gemini(gclient2, model, artist, song, "dm")
+                            if text:
+                                st.session_state.df.loc[idx, "Draft DM"] = text
+                                written += 1
+                            else:
+                                errors += 1
+                                last_error = err
+                                row_failed = True
 
-                    st.session_state.df.loc[idx, "🔄 Regenerate"] = False
-                    progress.progress(min(1.0, (pos + 1) / total))
+                        if last_error and any(m in str(last_error).lower() for m in fatal_markers):
+                            aborted = f"Gemini rejected your key or the model, so the run was halted. Check the key in Settings and try again. Error: {last_error}"
+                            break
 
-                save_db(st.session_state.df)
-                if errors:
-                    flash("warning", f"Wrote {written} messages; {errors} failed and were left blank to retry. Last error: {last_error}")
-                else:
-                    flash("success", f"Wrote {written} messages for {total} artists. They're waiting in Send.")
-                st.rerun()
+                        consecutive = consecutive + 1 if row_failed else 0
+                        if consecutive >= 3:
+                            aborted = f"Gemini failed 3 artists in a row, so the run was stopped. Error: {last_error}"
+                            break
+
+                        if not row_failed:
+                            st.session_state.df.loc[idx, "🔄 Regenerate"] = False
+                        progress.progress(min(1.0, (pos + 1) / total))
+
+                    save_db(st.session_state.df)
+                    quota_hit = last_error and any(x in str(last_error).lower() for x in ["resource_exhausted", "quota", "429"])
+                    if aborted and quota_hit:
+                        flash("warning", f"Wrote {written} messages, then hit Gemini's rate/daily limit and stopped. Everything unwritten is still pending — wait a while (or enable billing on your Google AI account for higher limits), then press Write messages to continue where it left off.")
+                    elif aborted:
+                        flash("warning", f"Stopped after writing {written} messages. {aborted}")
+                    elif errors:
+                        flash("warning", f"Wrote {written} messages; {errors} failed and stayed pending for retry. Last error: {last_error}")
+                    else:
+                        flash("success", f"Wrote {written} messages for {total} artists with {model}. They're waiting in Send.")
+                    st.rerun()
 
 # ============================================================================
 # PAGE: Send
@@ -1246,18 +1382,28 @@ def page_settings():
         st.caption("Streamlit Cloud wipes this app's disk whenever it restarts. Download a backup after every session; restore it here when the data disappears.")
         df = st.session_state.df
         st.download_button(
-            "📥 Download full backup (.csv)",
-            data=df.drop(columns=["🗑️ Blacklist"], errors="ignore").to_csv(index=False).encode("utf-8"),
-            file_name="wavy_outreach_backup.csv",
-            mime="text/csv",
+            "📥 Download full backup (.zip)",
+            data=build_backup_zip(df),
+            file_name="wavy_outreach_backup.zip",
+            mime="application/zip",
             type="primary",
             disabled=df.empty,
+            help="Includes your leads plus the blacklist, seen-videos, and scrape memory.",
         )
-        restore_file = st.file_uploader("Restore from a backup or an old app's export", type=["csv"])
+        restore_file = st.file_uploader("Restore a backup (.zip) or an old app's export (.csv)", type=["zip", "csv"])
         mode = st.radio("Restore mode", ["Merge with current leads", "Replace everything"], horizontal=True)
         if restore_file is not None and st.button("Restore now"):
             try:
-                incoming = ensure_schema(pd.read_csv(restore_file))
+                if restore_file.name.lower().endswith(".zip"):
+                    z = zipfile.ZipFile(restore_file)
+                    csv_names = [n for n in z.namelist() if n.lower().endswith(".csv")]
+                    if not csv_names:
+                        raise ValueError("No CSV found inside that ZIP.")
+                    csv_name = DB_FILE if DB_FILE in csv_names else csv_names[0]
+                    incoming = ensure_schema(pd.read_csv(z.open(csv_name)))
+                    restore_memory_from_zip(z, replace=(mode == "Replace everything"))
+                else:
+                    incoming = ensure_schema(pd.read_csv(restore_file))
                 if mode == "Replace everything" or st.session_state.df.empty:
                     st.session_state.df = incoming
                     added = len(incoming)
