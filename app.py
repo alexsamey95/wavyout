@@ -580,8 +580,26 @@ scraped_googles = load_json_set(SCRAPED_GOOGLES_FILE)
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+@import url('https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@20..48,100..700,0..1,-50..200&display=block');
 
-html, body, [class*="st-"], p, li, label, input, textarea {
+/* Self-healing icons: load Material Symbols ourselves and pin it to icon
+   elements, so icons render even if Streamlit's own font copy fails to load
+   (ad blockers, network hiccups). Raw text like "expand_more" = font missing. */
+span[data-testid="stIconMaterial"], [class*="material-symbols"] {
+    font-family: 'Material Symbols Rounded' !important;
+    font-weight: normal !important;
+    font-style: normal;
+    letter-spacing: normal;
+    text-transform: none;
+    line-height: 1;
+    -webkit-font-feature-settings: 'liga';
+    font-feature-settings: 'liga';
+    font-variation-settings: 'FILL' 0, 'wght' 400, 'GRAD' 0, 'opsz' 24;
+}
+
+/* Narrow selectors only — anything broader breaks Streamlit's icon font
+   and renders icons as raw text like "keyboard_double_arrow_right". */
+p, li, label, input, textarea, [data-testid="stMarkdownContainer"] p {
     font-family: 'Inter', -apple-system, sans-serif;
 }
 h1, h2, h3, [data-testid="stMetricValue"] {
@@ -601,13 +619,22 @@ h1 { text-transform: uppercase; letter-spacing: 0.03em; }
 </style>
 """, unsafe_allow_html=True)
 
+STAGE_COLORS = {
+    "Leads":       ("#9AA3B2", "#3E434D"),  # slate — raw material
+    "Contactable": ("#37B8C4", "#14555C"),  # teal — reachable
+    "Drafted":     ("#F0A93B", "#7A5210"),  # brand amber — work done
+    "Contacted":   ("#E8763A", "#77320F"),  # hot orange — out the door
+    "Replied":     ("#3BC474", "#155A33"),  # green — success
+}
+
 def vu_meter(label, count, total):
     pct = 0 if total <= 0 or count <= 0 else max(6, int(round(100 * count / total)))
+    hi, lo = STAGE_COLORS.get(label, (ACCENT, "#7A5210"))
     return f"""
     <div style="text-align:center;">
       <div style="height:110px;background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.10);
                   border-radius:8px;display:flex;align-items:flex-end;overflow:hidden;">
-        <div style="width:100%;height:{pct}%;background:linear-gradient(180deg,{ACCENT},#7a5210);"></div>
+        <div style="width:100%;height:{pct}%;background:linear-gradient(180deg,{hi},{lo});"></div>
       </div>
       <div style="margin-top:6px;font-size:1.35rem;font-weight:700;font-variant-numeric:tabular-nums;">{count}</div>
       <div style="font-family:'IBM Plex Mono',monospace;font-size:0.7rem;letter-spacing:.12em;text-transform:uppercase;opacity:.6;">{label}</div>
