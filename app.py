@@ -32,7 +32,14 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-ACCENT = "#F0A93B"  # VU-meter amber (matches .streamlit/config.toml)
+ACCENT = "#F0A93B"      # brand accent (keep in sync with .streamlit/config.toml primaryColor)
+BRAND_URL = "https://www.wavymixing.com"
+BRAND_LOGO = "https://wavymixing.com/logo.webp"
+
+try:
+    st.logo(BRAND_LOGO, link=BRAND_URL, size="large")
+except Exception:
+    pass  # older Streamlit or offline — branding is cosmetic, never fatal
 
 # Storage files (note: on Streamlit Cloud this disk is temporary — the app
 # nudges you to download backups and can restore them in Settings)
@@ -572,6 +579,23 @@ scraped_googles = load_json_set(SCRAPED_GOOGLES_FILE)
 # ----------------------------------------------------------------------------
 st.markdown("""
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap');
+
+html, body, [class*="st-"], p, li, label, input, textarea {
+    font-family: 'Inter', -apple-system, sans-serif;
+}
+h1, h2, h3, [data-testid="stMetricValue"] {
+    font-family: 'Space Grotesk', sans-serif !important;
+    letter-spacing: 0.01em;
+}
+h1 { text-transform: uppercase; letter-spacing: 0.03em; }
+.stButton button, .stDownloadButton button, .stLinkButton a, .stFormSubmitButton button {
+    font-family: 'Space Grotesk', sans-serif !important;
+    font-weight: 600;
+}
+[data-testid="stCaptionContainer"], .stCaption, code, .stCode, [data-testid="stMetricLabel"] {
+    font-family: 'IBM Plex Mono', monospace;
+}
 .block-container {padding-top: 2.2rem; max-width: 1200px;}
 [data-testid="stMetricValue"] {font-variant-numeric: tabular-nums;}
 </style>
@@ -586,7 +610,7 @@ def vu_meter(label, count, total):
         <div style="width:100%;height:{pct}%;background:linear-gradient(180deg,{ACCENT},#7a5210);"></div>
       </div>
       <div style="margin-top:6px;font-size:1.35rem;font-weight:700;font-variant-numeric:tabular-nums;">{count}</div>
-      <div style="font-size:0.72rem;letter-spacing:.09em;text-transform:uppercase;opacity:.6;">{label}</div>
+      <div style="font-family:'IBM Plex Mono',monospace;font-size:0.7rem;letter-spacing:.12em;text-transform:uppercase;opacity:.6;">{label}</div>
     </div>"""
 
 def highlight_rows(row):
@@ -615,6 +639,7 @@ def display_song(row):
 # ============================================================================
 def page_dashboard():
     show_flash()
+    st.caption("WAVYMIXING · OUTREACH CONSOLE")
     st.title("🎛️ Wavy Outreach")
     st.caption("Find artists → write messages → track replies. One database, start to finish.")
 
@@ -1044,7 +1069,11 @@ def page_write():
                         progress.progress(min(1.0, (pos + 1) / total))
                     save_db(st.session_state.df)
                     if aborted:
-                        flash("warning", f"Stopped early: Gemini failed 3 times in a row, so the remaining {total - pos - 1} leads weren't attempted. Nothing was overwritten — fix the issue and run again. Last error: {last_error}")
+                        err_low = str(last_error).lower()
+                        if "prepayment" in err_low or ("credit" in err_low and "429" in err_low):
+                            flash("warning", f"Stopped: your Google AI prepaid credits are used up — this is a billing balance issue, not a rate limit, so the usage dashboard will still look empty. Top up at ai.studio/projects (a small amount covers thousands of cleanings), then press Clean names again. The remaining {total - pos - 1} leads are still pending and nothing was overwritten.")
+                        else:
+                            flash("warning", f"Stopped early: Gemini failed 3 times in a row, so the remaining {total - pos - 1} leads weren't attempted. Nothing was overwritten — fix the issue and run again. Last error: {last_error}")
                     elif errors:
                         flash("warning", f"Cleaned {cleaned} leads; {errors} failed and stayed pending for retry. Last error: {last_error}")
                     else:
