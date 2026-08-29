@@ -80,7 +80,7 @@ def get_key(name):
 # Schema — one lead table for the whole pipeline
 # ----------------------------------------------------------------------------
 COLUMN_ORDER = [
-    "🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Reached_Out_Date",
+    "🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Reached_Out_Date",
     "Channel_ID", "Channel Name", "Cleaned Artist", "Cleaned Song",
     "Song Name", "Subscribers", "Email Address", "Instagram", "IG Followers",
     "IG Bio", "Draft Message", "🔄 Regenerate",
@@ -93,7 +93,7 @@ TEXT_DEFAULTS = {
     "IG Bio": "Not Scanned", "Draft Message": "",
     "Channel_URL": "", "Google Search Status": "Not Searched", "🔍 Quick Search": "",
 }
-BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "🔄 Regenerate"]
+BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "🔄 Regenerate"]
 INT_COLS = ["Subscribers", "IG Followers"]
 
 def quick_search_url(name):
@@ -135,6 +135,10 @@ def ensure_schema(df):
         if col not in df.columns:
             df[col] = 0
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0).astype(int)
+
+    if "Revenue" not in df.columns:
+        df["Revenue"] = 0.0
+    df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
 
     if "Reached_Out_Date" not in df.columns:
         df["Reached_Out_Date"] = pd.NaT
@@ -525,7 +529,8 @@ def has_any_draft(row):
 
 def pipeline_stats(df):
     if df.empty:
-        return {"total": 0, "contactable": 0, "drafted": 0, "contacted": 0, "replied": 0}
+        return {"total": 0, "contactable": 0, "drafted": 0, "contacted": 0, "replied": 0,
+                "free_mix": 0, "paid": 0, "revenue": 0.0}
     contactable = df.apply(lambda r: is_valid_data(r["Email Address"]) or is_valid_data(r["Instagram"]), axis=1).sum()
     drafted = df.apply(has_any_draft, axis=1).sum()
     return {
@@ -534,6 +539,9 @@ def pipeline_stats(df):
         "drafted": int(drafted),
         "contacted": int(df["Reached Out"].sum()),
         "replied": int(df["Replied"].sum()),
+        "free_mix": int(df["Free Mix Sent"].sum()) if "Free Mix Sent" in df.columns else 0,
+        "paid": int(df["Paid Customer"].sum()) if "Paid Customer" in df.columns else 0,
+        "revenue": float(df["Revenue"].sum()) if "Revenue" in df.columns else 0.0,
     }
 
 def compute_write_targets(df):
@@ -625,6 +633,8 @@ STAGE_COLORS = {
     "Drafted":     ("#F0A93B", "#7A5210"),  # brand amber — work done
     "Contacted":   ("#E8763A", "#77320F"),  # hot orange — out the door
     "Replied":     ("#3BC474", "#155A33"),  # green — success
+    "Free Mix":    ("#9B8CFF", "#3F3878"),  # violet — proof delivered
+    "Paid":        ("#EFC94C", "#6E5716"),  # gold — money
 }
 
 def vu_meter(label, count, total):
@@ -642,7 +652,9 @@ def vu_meter(label, count, total):
 
 def highlight_rows(row):
     color = ''
-    if row.get('Replied', False):
+    if row.get('Paid Customer', False):
+        color = 'background-color: rgba(239, 201, 76, 0.30)'
+    elif row.get('Replied', False):
         color = 'background-color: rgba(39, 174, 96, 0.35)'
     elif row.get('Reached Out', False):
         date_val = row.get('Reached_Out_Date')
@@ -683,16 +695,26 @@ def page_dashboard():
         return
 
     # Signature: the pipeline as five channel-strip meters
-    cols = st.columns(5)
+    cols = st.columns(7)
     meters = [
         ("Leads", stats["total"]), ("Contactable", stats["contactable"]),
         ("Drafted", stats["drafted"]), ("Contacted", stats["contacted"]),
-        ("Replied", stats["replied"]),
+        ("Replied", stats["replied"]), ("Free Mix", stats["free_mix"]),
+        ("Paid", stats["paid"]),
     ]
     for col, (label, count) in zip(cols, meters):
         col.markdown(vu_meter(label, count, stats["total"]), unsafe_allow_html=True)
 
     st.write("")
+    r1a, r1b, r1c = st.columns(3)
+    with r1a, st.container(border=True):
+        st.metric("💰 Revenue", f"${stats['revenue']:,.0f}")
+    with r1b, st.container(border=True):
+        conv = f"{(stats['paid'] / stats['free_mix'] * 100):.0f}%" if stats["free_mix"] else "—"
+        st.metric("Paying clients", stats["paid"], help="Conversion from free mixes: " + conv)
+    with r1c, st.container(border=True):
+        st.metric("Free mixes delivered", stats["free_mix"])
+
     m1, m2, m3 = st.columns(3)
     reply_rate = f"{(stats['replied'] / stats['contacted'] * 100):.0f}%" if stats["contacted"] else "—"
     with m1, st.container(border=True):
@@ -718,6 +740,9 @@ def page_dashboard():
         actions.append((f"Clean artist & song names for **{len(clean_targets)}** leads.", "✍️ Open Write", pg_write))
     if msg_targets:
         actions.append((f"Write messages for **{len(msg_targets)}** artists.", "✍️ Open Write", pg_write))
+    mixes_owed = int(((df["Replied"]) & (~df["Free Mix Sent"])).sum())
+    if mixes_owed:
+        actions.append((f"**{mixes_owed}** artists replied and are waiting on their free mix — deliver these first.", "📋 Open Leads", pg_leads))
     if queue_count:
         actions.append((f"**{queue_count}** drafts are ready to send.", "📤 Open Send", pg_send))
     if len(due):
@@ -1333,7 +1358,7 @@ def page_leads():
     col1, col2, col3 = st.columns(3)
     with col1: email_filter = st.radio("Email", ["All", "Has email", "No email"], horizontal=True)
     with col2: ig_filter = st.radio("Instagram", ["All", "Has IG", "No IG"], horizontal=True)
-    with col3: crm_filter = st.radio("Pipeline", ["All", "Not contacted", "Contacted", "Replied"], horizontal=True)
+    with col3: crm_filter = st.radio("Pipeline", ["All", "Not contacted", "Contacted", "Replied", "Free mix sent", "Paid"], horizontal=True)
 
     filtered_df = st.session_state.df.copy()
 
@@ -1351,8 +1376,10 @@ def page_leads():
     if crm_filter == "Not contacted": filtered_df = filtered_df[filtered_df["Reached Out"] == False]
     elif crm_filter == "Contacted": filtered_df = filtered_df[(filtered_df["Reached Out"] == True) & (filtered_df["Replied"] == False)]
     elif crm_filter == "Replied": filtered_df = filtered_df[filtered_df["Replied"] == True]
+    elif crm_filter == "Free mix sent": filtered_df = filtered_df[filtered_df["Free Mix Sent"] == True]
+    elif crm_filter == "Paid": filtered_df = filtered_df[filtered_df["Paid Customer"] == True]
 
-    st.caption(f"Showing {len(filtered_df)} of {len(st.session_state.df)} artists · amber = contacted · red = follow-up due · green = replied · 🗑️ removes AND bans, ❌ just removes")
+    st.caption(f"Showing {len(filtered_df)} of {len(st.session_state.df)} artists · amber = contacted · red = follow-up due · green = replied · gold = paying client · 🗑️ removes AND bans, ❌ just removes")
 
     edited_df = st.data_editor(
         filtered_df.style.apply(highlight_rows, axis=1),
@@ -1365,6 +1392,9 @@ def page_leads():
             "❌ Remove": st.column_config.CheckboxColumn("❌", help="Delete this lead without banning — it can come back on a future sync."),
             "Reached Out": st.column_config.CheckboxColumn("Reached Out"),
             "Replied": st.column_config.CheckboxColumn("Replied"),
+            "Free Mix Sent": st.column_config.CheckboxColumn("Free Mix", help="Tick when you've delivered their free mix."),
+            "Paid Customer": st.column_config.CheckboxColumn("Paid 💰", help="Tick when they become a paying client."),
+            "Revenue": st.column_config.NumberColumn("Revenue $", min_value=0, step=10, format="$%d", help="Total earned from this artist — update it every time they pay."),
             "🔄 Regenerate": st.column_config.CheckboxColumn("🔄", help="Rewrite this artist's messages on the next Write run."),
             "Reached_Out_Date": st.column_config.DateColumn("Contacted", disabled=True, format="MMM DD, YYYY"),
             "Subscribers": st.column_config.NumberColumn("Subs", format="%d"),
@@ -1414,7 +1444,7 @@ def page_leads():
             elif not is_reached and was_reached:
                 st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Reached_Out_Date"] = pd.NaT
 
-        for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "🔄 Regenerate"]:
+        for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "Free Mix Sent", "Paid Customer", "Revenue", "🔄 Regenerate"]:
             old_val = filtered_df.loc[idx, col]
             new_val = edited_df.loc[idx, col]
             if str(old_val) != str(new_val):
