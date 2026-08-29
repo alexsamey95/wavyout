@@ -1,10 +1,12 @@
-# Wavy Outreach theme — studio-dark with a VU-meter amber accent
+# WAVYMIXING brand theme — studio dark, matching wavymixing.com
+# To fine-tune: primaryColor is the accent used for buttons, meters and links.
 [theme]
 base = "dark"
 primaryColor = "#F0A93B"
-backgroundColor = "#0D0F13"
-secondaryBackgroundColor = "#161920"
-textColor = "#F2F0EA"
-
+backgroundColor = "#0A0A0C"
+secondaryBackgroundColor = "#151518"
+textColor = "#F4F2ED"
+ 
 [browser]
 gatherUsageStats = false
+ 
