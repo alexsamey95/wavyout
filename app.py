@@ -368,10 +368,10 @@ TASK: For every row, write ONE outreach message in the Draft Message column. Eac
 
 STRUCTURE every message like this, in fresh wording each time:
 1. GREETING with their name: "Hey {Artist}," / "What's up {Artist}," / "Yo {Artist}," — vary it. If the Artist value is clearly a channel name or contains junk, clean it up or greet without a name.
-2. THE HOOK: I listened to {Song} and a few of their other tracks, and I genuinely like their sound. Reference the actual track title naturally — strip any junk like hashtags, director tags, or feature lists when mentioning it.
+2. THE HOOK: I listened to {Song} and a few of their other tracks, and I really mess with their art — say it like I mean it, because I do. Reference the actual track title naturally — strip any junk like hashtags, director tags, or feature lists when mentioning it. ("really mess with" counts as the one allowed casual touch.)
 3. WHO I AM: Alex Wavy, mixing and mastering engineer specializing in trap, drill, and hip-hop. 5+ years, hybrid analog/digital studio.
 4. THE OFFER — be specific about what to send: they reply with ONE track they're working on (a rough bounce or the session files, whatever they have) and I send back a finished professional mix within 48 hours, completely free.
-5. WHY IT'S FREE — one honest line: no catch, it's how I show new artists what I do. If they like the result we can talk about working together; if not, they keep the mix anyway.
+5. THE INTENTION + WHY IT'S FREE — make it clear I genuinely want to work with this artist, and the free mix is how I'd like to start. One honest line: no catch — if they like the result, I want to keep working with them; if not, they keep the mix anyway. It must read like I picked them on purpose, not like a mass blast.
 6. CLEAR CTA + SIGN-OFF: tell them exactly what to do ("just reply with the track") and sign off "– Alex Wavy".
 
 STYLE RULES:
