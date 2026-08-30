@@ -81,7 +81,7 @@ def get_key(name):
 # Schema — one lead table for the whole pipeline
 # ----------------------------------------------------------------------------
 COLUMN_ORDER = [
-    "🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Reached_Out_Date", "Mix_Date", "Paid_Date", "Added_Date",
+    "🗑️ Blacklist", "❌ Remove", "Emailed", "DM'd", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Reached_Out_Date", "Email_Date", "DM_Date", "Mix_Date", "Paid_Date", "Added_Date",
     "Channel_ID", "Channel Name", "Cleaned Artist", "Cleaned Song",
     "Song Name", "Subscribers", "Email Address", "Instagram", "IG Followers",
     "IG Bio", "Draft Message", "🔄 Regenerate",
@@ -94,7 +94,7 @@ TEXT_DEFAULTS = {
     "IG Bio": "Not Scanned", "Draft Message": "",
     "Channel_URL": "", "Google Search Status": "Not Searched", "🔍 Quick Search": "",
 }
-BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "🔄 Regenerate"]
+BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Emailed", "DM'd", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "🔄 Regenerate"]
 INT_COLS = ["Subscribers", "IG Followers"]
 
 def quick_search_url(name):
@@ -141,10 +141,28 @@ def ensure_schema(df):
         df["Revenue"] = 0.0
     df["Revenue"] = pd.to_numeric(df["Revenue"], errors="coerce").fillna(0.0)
 
-    for dcol in ["Reached_Out_Date", "Mix_Date", "Paid_Date", "Added_Date"]:
+    for _flag in ["Emailed", "DM'd"]:
+        if _flag not in df.columns:
+            df[_flag] = False
+        df[_flag] = df[_flag].map(lambda v: str(v).strip().lower() == "true" if not isinstance(v, bool) else v).fillna(False).astype(bool)
+
+    for dcol in ["Reached_Out_Date", "Email_Date", "DM_Date", "Mix_Date", "Paid_Date", "Added_Date"]:
         if dcol not in df.columns:
             df[dcol] = pd.NaT
         df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
+
+    # Reached Out is derived: emailed OR DM'd. Migrate legacy single-flag data.
+    legacy_reached = df["Reached Out"].copy() if "Reached Out" in df.columns else pd.Series(False, index=df.index)
+    legacy_reached = legacy_reached.map(lambda v: str(v).strip().lower() == "true" if not isinstance(v, bool) else v).fillna(False).astype(bool)
+    orphan = legacy_reached & ~df["Emailed"] & ~df["DM'd"]
+    if orphan.any():
+        has_email = df["Email Address"].apply(is_valid_data)
+        df.loc[orphan & has_email, "Emailed"] = True
+        df.loc[orphan & ~has_email, "DM'd"] = True
+        carry = df["Reached_Out_Date"] if "Reached_Out_Date" in df.columns else pd.Series(pd.NaT, index=df.index)
+        df.loc[orphan & has_email & df["Email_Date"].isna(), "Email_Date"] = carry
+        df.loc[orphan & ~has_email & df["DM_Date"].isna(), "DM_Date"] = carry
+    df["Reached Out"] = df["Emailed"] | df["DM'd"] | legacy_reached
 
     # Old "[Claude Error]" strings must never block regeneration
     df["Draft Message"] = df["Draft Message"].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
@@ -529,6 +547,29 @@ def google_already_searched(row):
 def has_any_draft(row):
     return bool(str(row.get("Draft Message", "")).strip())
 
+def pending_channels(row):
+    """Channels this artist can still be contacted on."""
+    ch = []
+    if is_valid_data(row.get("Email Address", "")) and not bool(row.get("Emailed", False)):
+        ch.append("email")
+    if is_valid_data(row.get("Instagram", "")) and not bool(row.get("DM'd", False)):
+        ch.append("ig")
+    return ch
+
+def mark_channel_sent(idx, flag_col, date_col, row):
+    st.session_state.df.loc[idx, flag_col] = True
+    st.session_state.df.loc[idx, date_col] = pd.Timestamp.now().normalize()
+    st.session_state.df.loc[idx, "Reached Out"] = True
+    if pd.isna(st.session_state.df.loc[idx, "Reached_Out_Date"]):
+        st.session_state.df.loc[idx, "Reached_Out_Date"] = pd.Timestamp.now().normalize()
+    save_db(st.session_state.df)
+    if not pending_channels(st.session_state.df.loc[idx]):
+        st.session_state["send_current_id"] = None
+        flash("success", f"{display_name(row)} contacted on every channel — next up.")
+    else:
+        flash("success", f"Marked. {display_name(row)} still has another channel pending — it stays in the queue.")
+    st.rerun()
+
 def pipeline_stats(df):
     if df.empty:
         return {"total": 0, "contactable": 0, "drafted": 0, "contacted": 0, "replied": 0,
@@ -840,7 +881,7 @@ def page_dashboard():
     reply_rate = f"{(stats['replied'] / stats['contacted'] * 100):.0f}%" if stats["contacted"] else "—"
     with m1, st.container(border=True):
         st.metric("Reply rate", reply_rate)
-    queue_count = int(df.apply(lambda r: has_any_draft(r) and not r["Reached Out"], axis=1).sum())
+    queue_count = int(df.apply(lambda r: has_any_draft(r) and bool(pending_channels(r)), axis=1).sum())
     with m2, st.container(border=True):
         st.metric("Ready to send", queue_count)
     due = follow_ups_due(df)
@@ -910,15 +951,23 @@ def page_dashboard():
             if c2.button(label, key=f"act_{i}", width="stretch"):
                 st.switch_page(page)
 
+def last_touch_date(row):
+    dates = [d for d in [row.get("Email_Date"), row.get("DM_Date"), row.get("Reached_Out_Date")] if pd.notna(d)]
+    return max(dates) if dates else pd.NaT
+
 def follow_ups_due(df):
     if df.empty:
         return df
-    mask = (df["Reached Out"]) & (~df["Replied"]) & df["Reached_Out_Date"].notna()
+    mask = (df["Reached Out"]) & (~df["Replied"])
     sub = df[mask].copy()
     if sub.empty:
         return sub
-    days = (pd.Timestamp.now().normalize() - sub["Reached_Out_Date"].dt.normalize()).dt.days
-    return sub[days >= FOLLOW_UP_DAYS]
+    sub["_touch"] = sub.apply(last_touch_date, axis=1)
+    sub = sub[sub["_touch"].notna()]
+    if sub.empty:
+        return sub
+    days = (pd.Timestamp.now().normalize() - sub["_touch"].dt.normalize()).dt.days
+    return sub[days >= FOLLOW_UP_DAYS].drop(columns=["_touch"])
 
 # ============================================================================
 # PAGE: Collect
@@ -1345,10 +1394,21 @@ def page_send():
     st.caption("Review one artist at a time, send, and mark it done. Follow-ups surface here too.")
 
     df = st.session_state.df
-    queue_idx = [i for i in df.index if has_any_draft(df.loc[i]) and not df.loc[i, "Reached Out"]] if not df.empty else []
+    queue_all = [i for i in df.index if has_any_draft(df.loc[i]) and pending_channels(df.loc[i])] if not df.empty else []
+
+    chan = st.radio("Channel", ["All", "✉️ Email pending", "📸 DM pending"], horizontal=True, key="send_chan")
+    if chan == "✉️ Email pending":
+        queue_idx = [i for i in queue_all if "email" in pending_channels(df.loc[i])]
+    elif chan == "📸 DM pending":
+        queue_idx = [i for i in queue_all if "ig" in pending_channels(df.loc[i])]
+    else:
+        queue_idx = queue_all
 
     if not queue_idx:
-        st.info("The send queue is empty. Draft messages in **Write** and they'll show up here.")
+        if queue_all:
+            st.info("Nothing pending on this channel — switch the filter above.")
+        else:
+            st.info("The send queue is empty. Draft messages in **Write** and they'll show up here.")
     else:
         # Keep the selection stable across edits, reset it after marking sent
         prev_id = st.session_state.get("send_current_id")
@@ -1396,6 +1456,15 @@ def page_send():
                 if is_valid_data(row.get("IG Bio", "")):
                     with st.expander("IG bio"):
                         st.write(row["IG Bio"])
+                sent_bits = []
+                if bool(row.get("Emailed", False)):
+                    d = row.get("Email_Date")
+                    sent_bits.append("✉️ Emailed" + (f" {pd.to_datetime(d):%b %d}" if pd.notna(d) else ""))
+                if bool(row.get("DM'd", False)):
+                    d = row.get("DM_Date")
+                    sent_bits.append("📸 " + "DM'd" + (f" {pd.to_datetime(d):%b %d}" if pd.notna(d) else ""))
+                if sent_bits:
+                    st.caption(" · ".join(sent_bits))
 
             with right:
                 email_addr = str(row["Email Address"]).split(",")[0].strip()
@@ -1421,19 +1490,20 @@ def page_send():
                     st.code(msg, language=None, wrap_lines=True)
 
             st.divider()
-            a1, a2, a3 = st.columns([2, 1, 1])
-            if a1.button("✅ Mark as reached out", type="primary", key=f"sent_{choice}", width="stretch"):
-                st.session_state.df.loc[choice, "Reached Out"] = True
-                st.session_state.df.loc[choice, "Reached_Out_Date"] = pd.Timestamp.now().normalize()
-                save_db(st.session_state.df)
-                st.session_state["send_current_id"] = None
-                flash("success", f"Marked {display_name(row)} as reached out.")
-                st.rerun()
-            if a2.button("🔄 Rewrite next run", key=f"regen_{choice}", width="stretch", help="Flags this artist so Write drafts fresh messages next time."):
+            a1, a2, a3, a4 = st.columns([1.4, 1.4, 1, 1])
+            can_email = is_valid_data(email_addr) and not bool(row.get("Emailed", False))
+            can_dm = is_valid_data(row["Instagram"]) and not bool(row.get("DM'd", False))
+            if a1.button("✉️ Mark emailed", type="primary", key=f"em_{choice}", width="stretch", disabled=not can_email,
+                         help="Stamps today as the email date." if can_email else "No email, or already emailed."):
+                mark_channel_sent(choice, "Emailed", "Email_Date", row)
+            if a2.button("📸 Mark " + "DM'd", key=f"dm_{choice}", width="stretch", disabled=not can_dm,
+                         help="Stamps today as the DM date." if can_dm else "No Instagram, or already sent."):
+                mark_channel_sent(choice, "DM'd", "DM_Date", row)
+            if a3.button("🔄 Rewrite next run", key=f"regen_{choice}", width="stretch", help="Flags this artist so Write drafts fresh messages next time."):
                 st.session_state.df.loc[choice, "🔄 Regenerate"] = True
                 save_db(st.session_state.df)
                 st.toast("Flagged for regeneration.")
-            if a3.button("🚫 Blacklist", key=f"bl_{choice}", width="stretch", help="Removes this artist and bans the channel from future syncs."):
+            if a4.button("🚫 Blacklist", key=f"bl_{choice}", width="stretch", help="Removes this artist and bans the channel from future syncs."):
                 blacklist.add(str(row["Channel_ID"]))
                 save_json_set(blacklist, BLACKLIST_FILE)
                 st.session_state.df = st.session_state.df.drop(index=choice)
@@ -1513,7 +1583,7 @@ def page_leads():
     col1, col2, col3 = st.columns(3)
     with col1: email_filter = st.radio("Email", ["All", "Has email", "No email"], horizontal=True)
     with col2: ig_filter = st.radio("Instagram", ["All", "Has IG", "No IG"], horizontal=True)
-    with col3: crm_filter = st.radio("Pipeline", ["All", "Not contacted", "Contacted", "Replied", "Free mix sent", "Paid"], horizontal=True)
+    with col3: crm_filter = st.radio("Pipeline", ["All", "Not contacted", "Contacted", "Emailed", "DM'd", "Replied", "Free mix sent", "Paid"], horizontal=True)
 
     filtered_df = st.session_state.df.copy()
 
@@ -1530,6 +1600,8 @@ def page_leads():
     elif ig_filter == "No IG": filtered_df = filtered_df[~filtered_df["Instagram"].apply(is_valid_data)]
     if crm_filter == "Not contacted": filtered_df = filtered_df[filtered_df["Reached Out"] == False]
     elif crm_filter == "Contacted": filtered_df = filtered_df[(filtered_df["Reached Out"] == True) & (filtered_df["Replied"] == False)]
+    elif crm_filter == "Emailed": filtered_df = filtered_df[filtered_df["Emailed"] == True]
+    elif crm_filter == "DM'd": filtered_df = filtered_df[filtered_df["DM'd"] == True]
     elif crm_filter == "Replied": filtered_df = filtered_df[filtered_df["Replied"] == True]
     elif crm_filter == "Free mix sent": filtered_df = filtered_df[filtered_df["Free Mix Sent"] == True]
     elif crm_filter == "Paid": filtered_df = filtered_df[filtered_df["Paid Customer"] == True]
@@ -1545,13 +1617,17 @@ def page_leads():
             "Draft Message": st.column_config.TextColumn("Message", width="large", max_chars=2000),
             "🗑️ Blacklist": st.column_config.CheckboxColumn("🗑️", help="Remove this lead AND ban the channel from future syncs."),
             "❌ Remove": st.column_config.CheckboxColumn("❌", help="Delete this lead without banning — it can come back on a future sync."),
-            "Reached Out": st.column_config.CheckboxColumn("Reached Out"),
+            "Emailed": st.column_config.CheckboxColumn("✉️ Emailed", help="Tick when the email goes out — the date stamps automatically."),
+            "DM'd": st.column_config.CheckboxColumn("📸 DM'd", help="Tick when the DM goes out — the date stamps automatically."),
+            "Reached Out": st.column_config.CheckboxColumn("Reached", disabled=True, help="Automatic: on when emailed or DM-ed."),
             "Replied": st.column_config.CheckboxColumn("Replied"),
             "Free Mix Sent": st.column_config.CheckboxColumn("Free Mix", help="Tick when you've delivered their free mix."),
             "Paid Customer": st.column_config.CheckboxColumn("Paid 💰", help="Tick when they become a paying client."),
             "Revenue": st.column_config.NumberColumn("Revenue $", min_value=0, step=10, format="$%d", help="Total earned from this artist — update it every time they pay."),
             "🔄 Regenerate": st.column_config.CheckboxColumn("🔄", help="Rewrite this artist's messages on the next Write run."),
-            "Reached_Out_Date": st.column_config.DateColumn("Contacted", disabled=True, format="MMM DD, YYYY"),
+            "Reached_Out_Date": st.column_config.DateColumn("First contact", disabled=True, format="MMM DD, YYYY"),
+            "Email_Date": st.column_config.DateColumn("Emailed on", disabled=True, format="MMM DD"),
+            "DM_Date": st.column_config.DateColumn("DM'd on", disabled=True, format="MMM DD"),
             "Mix_Date": None,
             "Paid_Date": None,
             "Added_Date": None,
@@ -1588,21 +1664,13 @@ def page_leads():
         if ch_id in to_delete["Channel_ID"].values or ch_id in removed_ids:
             continue
 
-        was_reached = filtered_df.loc[idx, "Reached Out"]
-        is_reached = edited_df.loc[idx, "Reached Out"]
         was_replied = filtered_df.loc[idx, "Replied"]
         is_replied = edited_df.loc[idx, "Replied"]
-
-        if is_reached != was_reached or is_replied != was_replied:
+        if is_replied != was_replied:
             changes_made = True
-            st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Reached Out"] = is_reached
             st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Replied"] = is_replied
-            if is_reached and not was_reached:
-                st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Reached_Out_Date"] = pd.Timestamp.now().normalize()
-            elif not is_reached and was_reached:
-                st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Reached_Out_Date"] = pd.NaT
 
-        for flag_col, date_col in [("Free Mix Sent", "Mix_Date"), ("Paid Customer", "Paid_Date")]:
+        for flag_col, date_col in [("Emailed", "Email_Date"), ("DM'd", "DM_Date"), ("Free Mix Sent", "Mix_Date"), ("Paid Customer", "Paid_Date")]:
             was_f = filtered_df.loc[idx, flag_col]
             is_f = edited_df.loc[idx, flag_col]
             if is_f != was_f:
@@ -1611,6 +1679,14 @@ def page_leads():
                 st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, date_col] = (
                     pd.Timestamp.now().normalize() if is_f else pd.NaT
                 )
+
+        # Reached Out is derived from the channel flags
+        mask = st.session_state.df["Channel_ID"] == ch_id
+        reached_now = bool(st.session_state.df.loc[mask, "Emailed"].any() or st.session_state.df.loc[mask, "DM'd"].any())
+        if bool(st.session_state.df.loc[mask, "Reached Out"].any()) != reached_now:
+            changes_made = True
+            st.session_state.df.loc[mask, "Reached Out"] = reached_now
+            st.session_state.df.loc[mask, "Reached_Out_Date"] = pd.Timestamp.now().normalize() if reached_now else pd.NaT
 
         for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "Revenue", "🔄 Regenerate"]:
             old_val = filtered_df.loc[idx, col]
