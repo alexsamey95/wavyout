@@ -410,11 +410,22 @@ I genuinely want to work with this artist. I'm reaching out to connect with real
 
 STRUCTURE every message like this, in fresh wording each time:
 1. GREETING with their name: "Hey {Artist}," / "What's up {Artist}," / "Yo {Artist}," — vary it. If the Artist value is clearly a channel name or junk, clean it up or greet warmly without a name.
-2. THE HOOK: open by telling them I listened to {Song} (and a few of their other tracks) and that I genuinely love their music — warm and sincere, like I mean it, because I do. Vary the appreciation line naturally across rows so it never looks templated, e.g.: "I really love your music", "I really mess with your sound", "I've had {Song} on repeat", "your music genuinely moves me", "I really rate what you're doing", "I really mess with your art". Reference the actual track title naturally — strip any junk like hashtags, director tags, or feature lists. (Casual touches like "really mess with" are fine; keep it warm, not hype.)
+2. THE HOOK — appreciation comes FIRST, right after the greeting. The very first sentence of the body must open with a warm line of genuine appreciation for their music, BEFORE anything else. Lead with a varied phrase like: "I really love your music", "I really fw your music", "I really mess with your music/sound", "your music genuinely moves me", "I really rate what you're doing". Then, in the same or next sentence, tie it to the specific track — e.g. "I really love your music — been playing {Song} and a few of your other tracks on repeat." Vary the opener across rows so no two look templated. Reference the real track title naturally, stripping any junk (hashtags, director tags, feature lists). Keep it warm and sincere, not hype. Do NOT bury the appreciation in the middle of a sentence — it leads.
 3. WHO I AM: Alex Wavy, a mixing and mastering engineer specializing in trap, drill, and hip-hop — 5+ years on a hybrid analog/digital setup.
 4. THE OFFER, said like a human: I'd genuinely like to work with them, and I'd love to mix and master one of their tracks for free to show what I can bring to their sound. Explain gently what to send — just one track they're working on, whatever they have, even a rough version — and that I'll take care of it and get a finished, professional mix back to them within a day or two. Let it breathe across a sentence or two; do not compress it into fragments.
 5. WHY IT'S FREE + THE LONG GAME: one honest, unpushy line — there's no catch, this is just how I like to introduce myself to artists I believe in, and if they're happy with the mix I'd love to keep working together going forward. If not, the mix is theirs to keep either way.
 6. WARM CLOSE + SIGN-OFF: end like a real person hoping to connect — "If you're interested, please let me know." / "Let me know your thoughts." / "I hope to hear from you." / "Looking forward to hearing from you." Vary it. Then sign off "– Alex Wavy".
+
+LAYOUT (exact — every row must follow this): put the greeting on its own line, then a BLANK line, then the whole body (hook, who I am, offer, why-free) as one flowing paragraph, then a BLANK line, then the closing line and sign-off. Use real line breaks. The finished message looks like:
+
+Hey NAME,
+
+[body opens with the appreciation line first — e.g. "I really love your music, been playing {Song} on repeat." — then who I am, then the free mix offer in full sentences, then the no-catch/long-term line]
+
+Looking forward to hearing from you.
+– Alex Wavy
+
+Keep those blank lines in every message so there is space to read and room for a signature block.
 
 STYLE RULES:
 - #1 RULE — NEVER RUSH THE OFFER INTO A CHECKLIST. Every message must read like flowing, spoken English, not a list of terms crammed together with commas. This applies to EVERY row without exception, no matter how large the batch.
@@ -429,7 +440,7 @@ STYLE RULES:
 - Do NOT change Channel_ID, Artist, or Song. Fill ONLY the Draft Message column.
 - If a row is clearly a media channel or label rather than an artist, adapt warmly: I'd love to work with the artists they back and mix a track for free for any of them.
 
-OUTPUT: Give me back the complete CSV as a downloadable file — same columns, same rows, same order, Draft Message filled for every row. Use proper CSV quoting so commas inside messages don't break the format."""
+OUTPUT: Give me back the complete CSV as a downloadable file — same columns, same rows, same order, Draft Message filled for every row. Each Draft Message contains line breaks (see LAYOUT), so wrap every message in double quotes so the newlines and commas stay inside one cell and don't break the CSV."""
 
 def merge_message_csv(df, incoming):
     """Merge Draft Message values from a finished batch CSV back into the leads.
@@ -561,6 +572,49 @@ def google_already_searched(row):
 
 def has_any_draft(row):
     return bool(str(row.get("Draft Message", "")).strip())
+
+GREETING_RE = re.compile(r"^\s*((?:Hey|What's up|What's good|Yo|Hi|Hi there)\b[^,\u2014]*[,\u2014])\s*", re.I)
+
+def reformat_message(text):
+    """Greeting on line 1, blank line, body, blank line, close + sign-off.
+    Idempotent: if already formatted with blank lines, leaves it alone."""
+    t = str(text or "").strip()
+    if not t:
+        return t
+    if "\n\n" in t:  # already has blank-line layout
+        return t
+    # split off greeting
+    m = GREETING_RE.match(t)
+    greeting, rest = ("", t)
+    if m:
+        greeting = m.group(1).strip()
+        rest = t[m.end():].strip()
+    # split off sign-off (– Alex Wavy or - Alex Wavy), keeping the closing line with it
+    sign = ""
+    for marker in ["\u2013 Alex Wavy", "- Alex Wavy", "\u2014 Alex Wavy"]:
+        idx = rest.rfind(marker)
+        if idx != -1:
+            sign = rest[idx:].strip()
+            rest = rest[:idx].strip()
+            break
+    # pull the final sentence before the sign-off up as the closing line
+    close = ""
+    if sign and rest:
+        parts = re.split(r"(?<=[.!?])\s+", rest)
+        if len(parts) > 1:
+            close = parts[-1].strip()
+            rest = " ".join(parts[:-1]).strip()
+    body = rest
+    out = []
+    if greeting: out.append(greeting)
+    if greeting and body: out.append("")           # blank line under greeting
+    if body: out.append(body)
+    if (close or sign): out.append("")             # blank line above sign-off block
+    tail = []
+    if close: tail.append(close)
+    if sign: tail.append(sign)
+    if tail: out.append("\n".join(tail))
+    return "\n".join(out)
 
 def pending_channels(row):
     """Channels this artist can still be contacted on."""
@@ -1816,6 +1870,23 @@ def page_settings():
                 save_json_set(blacklist, BLACKLIST_FILE)
                 flash("success", "Blacklist cleared.")
                 st.rerun()
+
+    with st.container(border=True):
+        st.subheader("Message layout")
+        st.caption("Add spacing to existing drafts: greeting on its own line, a blank line, the message, a blank line, then the sign-off — leaving room for your signature. Safe to run repeatedly; already-spaced messages are left as they are.")
+        drafts = st.session_state.df["Draft Message"].apply(lambda x: bool(str(x).strip())).sum() if not st.session_state.df.empty else 0
+        if st.button(f"Reformat {int(drafts)} existing messages", disabled=(drafts == 0)):
+            n = 0
+            for i in st.session_state.df.index:
+                cur = st.session_state.df.loc[i, "Draft Message"]
+                if str(cur).strip():
+                    new_v = reformat_message(cur)
+                    if new_v != cur:
+                        st.session_state.df.loc[i, "Draft Message"] = new_v
+                        n += 1
+            save_db(st.session_state.df)
+            flash("success", f"Reformatted {n} messages with spacing for your signature.")
+            st.rerun()
 
     with st.container(border=True):
         st.subheader("Scrape memory")
