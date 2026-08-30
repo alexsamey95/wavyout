@@ -408,7 +408,7 @@ STRUCTURE every message like this, in fresh wording each time:
 3. WHO I AM: Alex Wavy, mixing and mastering engineer specializing in trap, drill, and hip-hop. 5+ years, hybrid analog/digital studio.
 4. THE OFFER — be specific about what to send: they reply with ONE track they're working on (a rough bounce or the session files, whatever they have) and I send back a finished professional mix within 48 hours, completely free.
 5. THE INTENTION + WHY IT'S FREE — make it clear I genuinely want to work with this artist, and the free mix is how I'd like to start. One honest line: no catch — if they like the result, I want to keep working with them; if not, they keep the mix anyway. It must read like I picked them on purpose, not like a mass blast.
-6. SOFT CTA + SIGN-OFF: a low-pressure invitation, never a salesy close. Good: "If you're interested, just let me know." / "If you'd like to hear it, feel free to reply with a track." / "No rush — reach out whenever if you want to try it." AVOID hype/closer phrasing like "Interested? Reply and I'll get started", "Let's do this", "Don't miss out". Then sign off "– Alex Wavy".
+6. WARM CLOSE + SIGN-OFF: end like a real person hoping to connect, not a salesperson closing. Use a genuine, low-pressure closing line such as: "If you're interested, please let me know." / "Let me know your thoughts." / "I hope to hear from you." / "Looking forward to hearing from you." / "Either way, would love to know what you think." Vary it between rows. Never use closer/hype phrasing ("Interested? Reply and I'll get started", "Let's do this", "Don't miss out"). Then sign off on the phrase — "– Alex Wavy".
 
 STYLE RULES:
 - 70 to 100 words. Short sentences. Clear and easy to read on a phone.
