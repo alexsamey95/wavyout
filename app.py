@@ -402,22 +402,32 @@ I've attached a CSV with the columns: Channel_ID, Artist, Song, Draft Message.
 
 TASK: For every row, write ONE outreach message in the Draft Message column. Each message gets sent exactly as written — sometimes as an email body, sometimes as an Instagram DM — so it must read naturally as both.
 
+THE VOICE — read this first, it matters most:
+Write like a real person who genuinely respects the artist and wants to connect — warm, polite, and human, but still street and friendly, not corporate. Full, comprehensible sentences that flow when read aloud. Do NOT cram the offer into a rushed, comma-spliced checklist like "rough bounce is fine, back within two days, free" — that reads robotic. Slow down and say it like you'd say it to someone you actually admire. Sympathetic and easygoing, never pushy, never a sales pitch.
+
+THE INTENTION behind every message (weave it in naturally, don't state it mechanically):
+I genuinely want to work with this artist. I'm reaching out to connect with real talent and offer to mix and master one of their tracks for free — not as a gimmick, but to show what I can do. My honest hope is that if they like the result, it turns into a long-term working relationship. It should feel like I chose them on purpose and would be glad to have them as a long-term client.
+
 STRUCTURE every message like this, in fresh wording each time:
-1. GREETING with their name: "Hey {Artist}," / "What's up {Artist}," / "Yo {Artist}," — vary it. If the Artist value is clearly a channel name or contains junk, clean it up or greet without a name.
-2. THE HOOK: I listened to {Song} and a few of their other tracks, and I really mess with their art — say it like I mean it, because I do. Reference the actual track title naturally — strip any junk like hashtags, director tags, or feature lists when mentioning it. ("really mess with" counts as the one allowed casual touch.)
-3. WHO I AM: Alex Wavy, mixing and mastering engineer specializing in trap, drill, and hip-hop. 5+ years, hybrid analog/digital studio.
-4. THE OFFER — be specific about what to send: they reply with ONE track they're working on (a rough bounce or the session files, whatever they have) and I send back a finished professional mix within 48 hours, completely free.
-5. THE INTENTION + WHY IT'S FREE — make it clear I genuinely want to work with this artist, and the free mix is how I'd like to start. One honest line: no catch — if they like the result, I want to keep working with them; if not, they keep the mix anyway. It must read like I picked them on purpose, not like a mass blast.
-6. WARM CLOSE + SIGN-OFF: end like a real person hoping to connect, not a salesperson closing. Use a genuine, low-pressure closing line such as: "If you're interested, please let me know." / "Let me know your thoughts." / "I hope to hear from you." / "Looking forward to hearing from you." / "Either way, would love to know what you think." Vary it between rows. Never use closer/hype phrasing ("Interested? Reply and I'll get started", "Let's do this", "Don't miss out"). Then sign off on the phrase — "– Alex Wavy".
+1. GREETING with their name: "Hey {Artist}," / "What's up {Artist}," / "Yo {Artist}," — vary it. If the Artist value is clearly a channel name or junk, clean it up or greet warmly without a name.
+2. THE HOOK: open by telling them I listened to {Song} (and a few of their other tracks) and that I genuinely love their music — warm and sincere, like I mean it, because I do. Vary the appreciation line naturally across rows so it never looks templated, e.g.: "I really love your music", "I really mess with your sound", "I've had {Song} on repeat", "your music genuinely moves me", "I really rate what you're doing", "I really mess with your art". Reference the actual track title naturally — strip any junk like hashtags, director tags, or feature lists. (Casual touches like "really mess with" are fine; keep it warm, not hype.)
+3. WHO I AM: Alex Wavy, a mixing and mastering engineer specializing in trap, drill, and hip-hop — 5+ years on a hybrid analog/digital setup.
+4. THE OFFER, said like a human: I'd genuinely like to work with them, and I'd love to mix and master one of their tracks for free to show what I can bring to their sound. Explain gently what to send — just one track they're working on, whatever they have, even a rough version — and that I'll take care of it and get a finished, professional mix back to them within a day or two. Let it breathe across a sentence or two; do not compress it into fragments.
+5. WHY IT'S FREE + THE LONG GAME: one honest, unpushy line — there's no catch, this is just how I like to introduce myself to artists I believe in, and if they're happy with the mix I'd love to keep working together going forward. If not, the mix is theirs to keep either way.
+6. WARM CLOSE + SIGN-OFF: end like a real person hoping to connect — "If you're interested, please let me know." / "Let me know your thoughts." / "I hope to hear from you." / "Looking forward to hearing from you." Vary it. Then sign off "– Alex Wavy".
 
 STYLE RULES:
-- 70 to 100 words. Short sentences. Clear and easy to read on a phone.
-- Professional but human — a real engineer reaching out, not a marketing bot and not a try-hard.
-- Keep slang minimal (one casual touch max) and no profanity.
-- BANNED: "opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well", "let's get started", "let's do this", "don't miss", "act now", "Interested?" as a one-word hook, emojis, links, fake flattery. Keep the whole message low-pressure — an offer between peers, never a sales close.
-- Vary the structure and wording between rows so no two messages look templated.
+- #1 RULE — NEVER RUSH THE OFFER INTO A CHECKLIST. Every message must read like flowing, spoken English, not a list of terms crammed together with commas. This applies to EVERY row without exception, no matter how large the batch.
+  BAD (rushed, robotic, banned): "send one track, rough bounce is fine, back within two days, free."
+  GOOD (warm, complete sentences): "If you're up for it, just send over one track you're working on — even a rough version is totally fine. I'll mix and master it properly and get it back to you within a day or two, completely free."
+  If a sentence has three or more comma-separated fragments in a row, rewrite it as full sentences before moving on.
+- 80 to 110 words. Complete, readable sentences — err toward warmth and clarity over brevity. Never sacrifice readability to save words.
+- Polite, sympathetic, street-but-professional. A real engineer who respects the artist, not a marketing bot and not a hustler.
+- Minimal slang (one casual touch max) and no profanity.
+- BANNED: "opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to" (as filler), "hope this finds you well", "let's get started", "let's do this", "don't miss", "act now", "Interested?" as a one-word hook, emojis, links, fake flattery, and rushed comma-spliced fragments like "rough bounce is fine, back within two days, free".
+- Vary structure and wording between rows so no two messages look templated.
 - Do NOT change Channel_ID, Artist, or Song. Fill ONLY the Draft Message column.
-- If a row is clearly a media channel rather than an artist, adapt the offer: I'll mix a track free for any artist they work with.
+- If a row is clearly a media channel or label rather than an artist, adapt warmly: I'd love to work with the artists they back and mix a track for free for any of them.
 
 OUTPUT: Give me back the complete CSV as a downloadable file — same columns, same rows, same order, Draft Message filled for every row. Use proper CSV quoting so commas inside messages don't break the format."""
 
