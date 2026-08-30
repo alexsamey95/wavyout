@@ -408,13 +408,13 @@ STRUCTURE every message like this, in fresh wording each time:
 3. WHO I AM: Alex Wavy, mixing and mastering engineer specializing in trap, drill, and hip-hop. 5+ years, hybrid analog/digital studio.
 4. THE OFFER — be specific about what to send: they reply with ONE track they're working on (a rough bounce or the session files, whatever they have) and I send back a finished professional mix within 48 hours, completely free.
 5. THE INTENTION + WHY IT'S FREE — make it clear I genuinely want to work with this artist, and the free mix is how I'd like to start. One honest line: no catch — if they like the result, I want to keep working with them; if not, they keep the mix anyway. It must read like I picked them on purpose, not like a mass blast.
-6. CLEAR CTA + SIGN-OFF: tell them exactly what to do ("just reply with the track") and sign off "– Alex Wavy".
+6. SOFT CTA + SIGN-OFF: a low-pressure invitation, never a salesy close. Good: "If you're interested, just let me know." / "If you'd like to hear it, feel free to reply with a track." / "No rush — reach out whenever if you want to try it." AVOID hype/closer phrasing like "Interested? Reply and I'll get started", "Let's do this", "Don't miss out". Then sign off "– Alex Wavy".
 
 STYLE RULES:
 - 70 to 100 words. Short sentences. Clear and easy to read on a phone.
 - Professional but human — a real engineer reaching out, not a marketing bot and not a try-hard.
 - Keep slang minimal (one casual touch max) and no profanity.
-- BANNED: "opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well", emojis, links, fake flattery.
+- BANNED: "opportunity", "elevate", "next level", "game-changer", "incredible", "amazing", "I'd love to", "hope this finds you well", "let's get started", "let's do this", "don't miss", "act now", "Interested?" as a one-word hook, emojis, links, fake flattery. Keep the whole message low-pressure — an offer between peers, never a sales close.
 - Vary the structure and wording between rows so no two messages look templated.
 - Do NOT change Channel_ID, Artist, or Song. Fill ONLY the Draft Message column.
 - If a row is clearly a media channel rather than an artist, adapt the offer: I'll mix a track free for any artist they work with.
