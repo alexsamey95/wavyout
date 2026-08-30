@@ -410,7 +410,9 @@ I genuinely want to work with this artist. I'm reaching out to connect with real
 
 STRUCTURE every message like this, in fresh wording each time:
 1. GREETING with their name: "Hey {Artist}," / "What's up {Artist}," / "Yo {Artist}," — vary it. If the Artist value is clearly a channel name or junk, clean it up or greet warmly without a name.
-2. THE HOOK — appreciation comes FIRST, right after the greeting. The very first sentence of the body must open with a warm line of genuine appreciation for their music, BEFORE anything else. Lead with a varied phrase like: "I really love your music", "I really fw your music", "I really mess with your music/sound", "your music genuinely moves me", "I really rate what you're doing". Then, in the same or next sentence, tie it to the specific track — e.g. "I really love your music — been playing {Song} and a few of your other tracks on repeat." Vary the opener across rows so no two look templated. Reference the real track title naturally, stripping any junk (hashtags, director tags, feature lists). Keep it warm and sincere, not hype. Do NOT bury the appreciation in the middle of a sentence — it leads.
+2. THE HOOK — appreciation comes FIRST, right after the greeting. The very first sentence of the body must open with a warm line of genuine appreciation for their music, BEFORE anything else. Lead with a varied phrase like: "I really love your music", "I really fw your music", "I really mess with your music/sound", "your music genuinely moves me", "I really rate what you're doing". Then, in the same or next sentence, tie it to the specific track — simply. Good: "I really love your music, {Song} especially." / "I really fw your sound — {Song} is a favourite." / "I really mess with your music, been playing {Song} a lot." Keep it short and plain. Vary the opener across rows. Reference the real track title naturally, stripping any junk (hashtags, director tags, feature lists). Do NOT bury the appreciation mid-sentence — it leads.
+
+KEEP THE APPRECIATION SIMPLE — no corny filler. Say you like the music and name the track, then move on. BANNED filler phrases (these sound like a bot padding): "kept me listening", "kept me there", "your other tracks hold up", "hold up too", "went through your whole catalog", "the rest of your catalog kept me", "pulled me straight in", "had it on repeat along with a few of your other tracks". One clean sentence of genuine appreciation is better than a stacked pile of them. Do not list multiple reactions to the music — one honest line is enough.
 3. WHO I AM: Alex Wavy, a mixing and mastering engineer specializing in trap, drill, and hip-hop — 5+ years on a hybrid analog/digital setup.
 4. THE OFFER, said like a human: I'd genuinely like to work with them, and I'd love to mix and master one of their tracks for free to show what I can bring to their sound. Explain gently what to send — just one track they're working on, whatever they have, even a rough version — and that I'll take care of it and get a finished, professional mix back to them within a day or two. Let it breathe across a sentence or two; do not compress it into fragments.
 5. WHY IT'S FREE + THE LONG GAME: one honest, unpushy line — there's no catch, this is just how I like to introduce myself to artists I believe in, and if they're happy with the mix I'd love to keep working together going forward. If not, the mix is theirs to keep either way.
@@ -1650,7 +1652,7 @@ def page_leads():
         st.info("No leads yet. Sync a playlist in **Collect** — or add one manually above.")
         return
 
-    search = st.text_input("Search", placeholder="Search by artist or channel name...", label_visibility="collapsed")
+    search = st.text_input("Search", placeholder="Search by artist name, Instagram, or email...", label_visibility="collapsed")
     col1, col2, col3 = st.columns(3)
     with col1: email_filter = st.radio("Email", ["All", "Has email", "No email"], horizontal=True)
     with col2: ig_filter = st.radio("Instagram", ["All", "Has IG", "No IG"], horizontal=True)
@@ -1660,10 +1662,18 @@ def page_leads():
 
     if search.strip():
         s = search.strip().lower()
-        filtered_df = filtered_df[
-            filtered_df["Channel Name"].str.lower().str.contains(s, na=False)
-            | filtered_df["Cleaned Artist"].str.lower().str.contains(s, na=False)
-        ]
+        def _match(col):
+            return filtered_df[col].astype(str).str.lower().str.contains(s, na=False, regex=False) if col in filtered_df.columns else False
+        mask = (
+            _match("Channel Name")
+            | _match("Cleaned Artist")
+            | _match("Instagram")
+            | _match("Email Address")
+            | _match("Song Name")
+            | _match("Cleaned Song")
+            | _match("IG Bio")
+        )
+        filtered_df = filtered_df[mask]
 
     if email_filter == "Has email": filtered_df = filtered_df[filtered_df["Email Address"].apply(is_valid_data)]
     elif email_filter == "No email": filtered_df = filtered_df[~filtered_df["Email Address"].apply(is_valid_data)]
