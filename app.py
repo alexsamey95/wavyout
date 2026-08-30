@@ -162,7 +162,12 @@ def ensure_schema(df):
         carry = df["Reached_Out_Date"] if "Reached_Out_Date" in df.columns else pd.Series(pd.NaT, index=df.index)
         df.loc[orphan & has_email & df["Email_Date"].isna(), "Email_Date"] = carry
         df.loc[orphan & ~has_email & df["DM_Date"].isna(), "DM_Date"] = carry
-    df["Reached Out"] = df["Emailed"] | df["DM'd"] | legacy_reached
+    # Reached Out ticks only when EVERY available channel has been used:
+    # (has email -> emailed) AND (has IG -> DM'd) AND at least one touch.
+    touched = df["Emailed"] | df["DM'd"]
+    _has_em = df["Email Address"].apply(is_valid_data)
+    _has_ig = df["Instagram"].apply(is_valid_data)
+    df["Reached Out"] = touched & (~_has_em | df["Emailed"]) & (~_has_ig | df["DM'd"])
 
     # Old "[Claude Error]" strings must never block regeneration
     df["Draft Message"] = df["Draft Message"].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
@@ -559,8 +564,10 @@ def pending_channels(row):
 def mark_channel_sent(idx, flag_col, date_col, row):
     st.session_state.df.loc[idx, flag_col] = True
     st.session_state.df.loc[idx, date_col] = pd.Timestamp.now().normalize()
-    st.session_state.df.loc[idx, "Reached Out"] = True
-    if pd.isna(st.session_state.df.loc[idx, "Reached_Out_Date"]):
+    row_now = st.session_state.df.loc[idx]
+    fully = bool(row_now["Emailed"] or row_now["DM'd"]) and not pending_channels(row_now)
+    st.session_state.df.loc[idx, "Reached Out"] = fully
+    if fully:
         st.session_state.df.loc[idx, "Reached_Out_Date"] = pd.Timestamp.now().normalize()
     save_db(st.session_state.df)
     if not pending_channels(st.session_state.df.loc[idx]):
@@ -818,8 +825,8 @@ def highlight_rows(row):
         color = 'background-color: rgba(239, 201, 76, 0.30)'
     elif row.get('Replied', False):
         color = 'background-color: rgba(39, 174, 96, 0.35)'
-    elif row.get('Reached Out', False):
-        date_val = row.get('Reached_Out_Date')
+    elif row.get('Emailed', False) or row.get("DM'd", False):
+        date_val = last_touch_date(row)
         if pd.notna(date_val):
             days_passed = (pd.Timestamp.now().normalize() - pd.to_datetime(date_val).normalize()).days
             color = 'background-color: rgba(231, 76, 60, 0.35)' if days_passed >= FOLLOW_UP_DAYS else 'background-color: rgba(240, 169, 59, 0.28)'
@@ -958,7 +965,7 @@ def last_touch_date(row):
 def follow_ups_due(df):
     if df.empty:
         return df
-    mask = (df["Reached Out"]) & (~df["Replied"])
+    mask = (df["Emailed"] | df["DM'd"]) & (~df["Replied"])
     sub = df[mask].copy()
     if sub.empty:
         return sub
@@ -1520,7 +1527,7 @@ def page_send():
     else:
         for idx in due.index[:25]:
             row = due.loc[idx]
-            days = (pd.Timestamp.now().normalize() - pd.to_datetime(row["Reached_Out_Date"]).normalize()).days
+            days = (pd.Timestamp.now().normalize() - pd.to_datetime(last_touch_date(row)).normalize()).days
             with st.container(border=True):
                 c1, c2, c3, c4 = st.columns([3, 1.2, 1.2, 1.2])
                 c1.markdown(f"**{display_name(row)}** · contacted {days} days ago")
@@ -1619,7 +1626,7 @@ def page_leads():
             "❌ Remove": st.column_config.CheckboxColumn("❌", help="Delete this lead without banning — it can come back on a future sync."),
             "Emailed": st.column_config.CheckboxColumn("✉️ Emailed", help="Tick when the email goes out — the date stamps automatically."),
             "DM'd": st.column_config.CheckboxColumn("📸 DM'd", help="Tick when the DM goes out — the date stamps automatically."),
-            "Reached Out": st.column_config.CheckboxColumn("Reached", disabled=True, help="Automatic: on when emailed or DM-ed."),
+            "Reached Out": st.column_config.CheckboxColumn("Reached", disabled=True, help="Automatic: ticks only once every available channel (email and IG) has been contacted."),
             "Replied": st.column_config.CheckboxColumn("Replied"),
             "Free Mix Sent": st.column_config.CheckboxColumn("Free Mix", help="Tick when you've delivered their free mix."),
             "Paid Customer": st.column_config.CheckboxColumn("Paid 💰", help="Tick when they become a paying client."),
@@ -1680,13 +1687,17 @@ def page_leads():
                     pd.Timestamp.now().normalize() if is_f else pd.NaT
                 )
 
-        # Reached Out is derived from the channel flags
+        # Reached Out is derived: ticks only when every available channel is done
         mask = st.session_state.df["Channel_ID"] == ch_id
-        reached_now = bool(st.session_state.df.loc[mask, "Emailed"].any() or st.session_state.df.loc[mask, "DM'd"].any())
-        if bool(st.session_state.df.loc[mask, "Reached Out"].any()) != reached_now:
-            changes_made = True
-            st.session_state.df.loc[mask, "Reached Out"] = reached_now
-            st.session_state.df.loc[mask, "Reached_Out_Date"] = pd.Timestamp.now().normalize() if reached_now else pd.NaT
+        sub = st.session_state.df.loc[mask]
+        if not sub.empty:
+            r0 = sub.iloc[0]
+            touched_now = bool(r0["Emailed"] or r0["DM'd"])
+            fully_now = touched_now and not pending_channels(r0)
+            if bool(r0["Reached Out"]) != fully_now:
+                changes_made = True
+                st.session_state.df.loc[mask, "Reached Out"] = fully_now
+                st.session_state.df.loc[mask, "Reached_Out_Date"] = pd.Timestamp.now().normalize() if fully_now else pd.NaT
 
         for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "Revenue", "🔄 Regenerate"]:
             old_val = filtered_df.loc[idx, col]
