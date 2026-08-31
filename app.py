@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from google import genai as google_genai
 from google.genai import types as genai_types
@@ -166,12 +167,8 @@ def ensure_schema(df):
         carry = df["Reached_Out_Date"] if "Reached_Out_Date" in df.columns else pd.Series(pd.NaT, index=df.index)
         df.loc[orphan & has_email & df["Email_Date"].isna(), "Email_Date"] = carry
         df.loc[orphan & ~has_email & df["DM_Date"].isna(), "DM_Date"] = carry
-    # Reached Out ticks only when EVERY available channel has been used:
-    # (has email -> emailed) AND (has IG -> DM'd) AND at least one touch.
-    touched = df["Emailed"] | df["DM'd"]
-    _has_em = df["Email Address"].apply(is_valid_data).astype(bool)
-    _has_ig = df["Instagram"].apply(is_valid_data).astype(bool)
-    df["Reached Out"] = touched & (~_has_em | df["Emailed"]) & (~_has_ig | df["DM'd"])
+    # Reached Out ticks as soon as the artist has been contacted on ANY channel.
+    df["Reached Out"] = df["Emailed"] | df["DM'd"]
 
     # Old "[Claude Error]" strings must never block regeneration
     df["Draft Message"] = df["Draft Message"].apply(lambda v: "" if str(v).strip().startswith("[Claude Error") else v)
@@ -854,17 +851,13 @@ def pending_channels(row):
 def mark_channel_sent(idx, flag_col, date_col, row):
     st.session_state.df.loc[idx, flag_col] = True
     st.session_state.df.loc[idx, date_col] = pd.Timestamp.now().normalize()
-    row_now = st.session_state.df.loc[idx]
-    fully = bool(row_now["Emailed"] or row_now["DM'd"]) and not pending_channels(row_now)
-    st.session_state.df.loc[idx, "Reached Out"] = fully
-    if fully:
+    # One touch on ANY channel = contacted. Stamp the date on first contact only.
+    if not bool(st.session_state.df.loc[idx, "Reached Out"]):
         st.session_state.df.loc[idx, "Reached_Out_Date"] = pd.Timestamp.now().normalize()
+    st.session_state.df.loc[idx, "Reached Out"] = True
     save_db(st.session_state.df)
-    if not pending_channels(st.session_state.df.loc[idx]):
-        st.session_state["send_current_id"] = None
-        flash("success", f"{display_name(row)} contacted on every channel — next up.")
-    else:
-        flash("success", f"Marked. {display_name(row)} still has another channel pending — it stays in the queue.")
+    st.session_state["send_current_id"] = None
+    flash("success", f"{display_name(row)} marked as contacted — next up.")
     st.rerun()
 
 def pipeline_stats(df):
@@ -1180,7 +1173,7 @@ def page_dashboard():
     reply_rate = f"{(stats['replied'] / stats['contacted'] * 100):.0f}%" if stats["contacted"] else "—"
     with m1, st.container(border=True):
         st.metric("Reply rate", reply_rate)
-    queue_count = int(df.apply(lambda r: has_any_draft(r) and bool(pending_channels(r)), axis=1).sum())
+    queue_count = int(df.apply(lambda r: has_any_draft(r) and bool(pending_channels(r)) and not bool(r["Reached Out"]), axis=1).sum())
     with m2, st.container(border=True):
         st.metric("Ready to send", queue_count)
     due = follow_ups_due(df)
@@ -1693,7 +1686,10 @@ def page_send():
     st.caption("Review one artist at a time, send, and mark it done. Follow-ups surface here too.")
 
     df = st.session_state.df
-    queue_all = [i for i in df.index if has_any_draft(df.loc[i]) and pending_channels(df.loc[i])] if not df.empty else []
+    # Contacted artists (emailed OR DM'd) drop out of the queue.
+    queue_all = [i for i in df.index
+                 if has_any_draft(df.loc[i]) and pending_channels(df.loc[i])
+                 and not bool(df.loc[i, "Reached Out"])] if not df.empty else []
 
     chan = st.radio("Channel", ["All", "✉️ Email pending", "📸 DM pending"], horizontal=True, key="send_chan")
     if chan == "✉️ Email pending":
@@ -1926,7 +1922,7 @@ def page_leads():
             "❌ Remove": st.column_config.CheckboxColumn("❌", help="Delete this lead without banning — it can come back on a future sync."),
             "Emailed": st.column_config.CheckboxColumn("✉️ Emailed", help="Tick when the email goes out — the date stamps automatically."),
             "DM'd": st.column_config.CheckboxColumn("📸 DM'd", help="Tick when the DM goes out — the date stamps automatically."),
-            "Reached Out": st.column_config.CheckboxColumn("Reached", disabled=True, help="Automatic: ticks only once every available channel (email and IG) has been contacted."),
+            "Reached Out": st.column_config.CheckboxColumn("Reached", disabled=True, help="Automatic: ticks as soon as you've emailed or DM'd this artist."),
             "Replied": st.column_config.CheckboxColumn("Replied"),
             "Free Mix Sent": st.column_config.CheckboxColumn("Free Mix", help="Tick when you've delivered their free mix."),
             "Paid Customer": st.column_config.CheckboxColumn("Paid 💰", help="Tick when they become a paying client."),
@@ -1987,17 +1983,16 @@ def page_leads():
                     pd.Timestamp.now().normalize() if is_f else pd.NaT
                 )
 
-        # Reached Out is derived: ticks only when every available channel is done
+        # Reached Out is derived: ticks as soon as either channel is contacted
         mask = st.session_state.df["Channel_ID"] == ch_id
         sub = st.session_state.df.loc[mask]
         if not sub.empty:
             r0 = sub.iloc[0]
-            touched_now = bool(r0["Emailed"] or r0["DM'd"])
-            fully_now = touched_now and not pending_channels(r0)
-            if bool(r0["Reached Out"]) != fully_now:
+            contacted_now = bool(r0["Emailed"] or r0["DM'd"])
+            if bool(r0["Reached Out"]) != contacted_now:
                 changes_made = True
-                st.session_state.df.loc[mask, "Reached Out"] = fully_now
-                st.session_state.df.loc[mask, "Reached_Out_Date"] = pd.Timestamp.now().normalize() if fully_now else pd.NaT
+                st.session_state.df.loc[mask, "Reached Out"] = contacted_now
+                st.session_state.df.loc[mask, "Reached_Out_Date"] = pd.Timestamp.now().normalize() if contacted_now else pd.NaT
 
         for col in ["Channel Name", "Subscribers", "Email Address", "Instagram", "IG Bio", "IG Followers", "Cleaned Artist", "Cleaned Song", "Draft Message", "Revenue", "🔄 Regenerate"]:
             old_val = filtered_df.loc[idx, col]
@@ -2017,7 +2012,8 @@ def page_leads():
         file_name="wavy_outreach_leads.csv",
         mime="text/csv",
     )
-    st.caption("⚠️ Streamlit Cloud storage is temporary — download a full backup in Settings after each session.")
+    if not cloud_enabled():
+        st.caption("⚠️ Streamlit Cloud storage is temporary — download a full backup in Settings after each session.")
 
 # ============================================================================
 # PAGE: Settings
@@ -2195,6 +2191,76 @@ with st.sidebar:
     st.caption(dots)
 
 nav.run()
+
+# ----------------------------------------------------------------------------
+# Keep scroll position — Streamlit rebuilds the page (and the leads table) on
+# every edit, which normally throws you back to the top. This invisible script
+# remembers where you were, per page, and puts you back there after each rerun.
+# ----------------------------------------------------------------------------
+components.html("""
+<script>
+(function () {
+  try {
+    var P = window.parent;
+    var D = P.document;
+    var KEY = "wavy-scroll:" + P.location.pathname;
+    var restoring = true;
+
+    function targets() {
+      var out = [];
+      var main = D.querySelector('section[data-testid="stMain"]') ||
+                 D.querySelector("section.stMain") ||
+                 D.querySelector("section.main") ||
+                 D.querySelector('[data-testid="stAppViewContainer"]');
+      if (main) out.push(["page", main]);
+      var grids = D.querySelectorAll(".dvn-scroller");
+      for (var i = 0; i < grids.length; i++) out.push(["grid" + i, grids[i]]);
+      return out;
+    }
+
+    function save() {
+      if (restoring) return;
+      var pos = { win: [P.scrollX || 0, P.scrollY || 0] };
+      var ts = targets();
+      for (var i = 0; i < ts.length; i++) pos[ts[i][0]] = [ts[i][1].scrollLeft, ts[i][1].scrollTop];
+      try { P.sessionStorage.setItem(KEY, JSON.stringify(pos)); } catch (e) {}
+    }
+
+    function hook() {
+      var ts = targets();
+      for (var i = 0; i < ts.length; i++) {
+        var el = ts[i][1];
+        if (!el.dataset.wavyHook) {
+          el.dataset.wavyHook = "1";
+          el.addEventListener("scroll", save, { passive: true });
+        }
+      }
+      if (!D.body.dataset.wavyWinHook) {
+        D.body.dataset.wavyWinHook = "1";
+        P.addEventListener("scroll", save, { passive: true });
+      }
+    }
+
+    var saved = {};
+    try { saved = JSON.parse(P.sessionStorage.getItem(KEY) || "{}"); } catch (e) {}
+
+    var tries = 0;
+    var timer = setInterval(function () {
+      tries += 1;
+      hook();
+      var ts = targets();
+      for (var i = 0; i < ts.length; i++) {
+        var p = saved[ts[i][0]];
+        if (p) { ts[i][1].scrollLeft = p[0]; ts[i][1].scrollTop = p[1]; }
+      }
+      if (saved.win) P.scrollTo(saved.win[0], saved.win[1]);
+      if (tries >= 8) { clearInterval(timer); restoring = false; }
+    }, 120);
+    setInterval(hook, 700);
+  } catch (e) {}
+})();
+</script>
+""", height=0)
 
 # ----------------------------------------------------------------------------
 # Cloud save — runs after the page so it captures everything this run changed.
