@@ -924,6 +924,124 @@ def enrich_targets(df, scraped_igs, scraped_googles):
     return ig_pending, google_pending
 
 # ----------------------------------------------------------------------------
+# One-click pipeline — Google-search IGs -> scrape bios -> clean names, in a
+# background thread on the server. The job keeps running after the browser
+# tab is closed; progress lives in shared state that any session can read.
+# ----------------------------------------------------------------------------
+@st.cache_resource
+def _pipeline_job():
+    """Shared job state: survives reruns, page switches, and closed tabs."""
+    return {"running": False, "stage": "", "detail": "", "frac": 0.0,
+            "log": [], "error": None, "started": 0.0, "finished": 0.0}
+
+def run_full_pipeline(job, apify_token, gemini_key):
+    """Background worker. Must never touch st.session_state or draw UI.
+    Reads the database from disk, saves after every stage, then cloud-syncs."""
+    def report(frac, text):
+        job["frac"] = float(min(1.0, max(0.0, frac)))
+        job["detail"] = str(text)
+
+    def begin(n, name):
+        job["stage"] = f"Step {n}/3 · {name}"
+        job["frac"] = 0.0
+        job["detail"] = ""
+        job["log"].append(f"▶ {name}")
+
+    def run_stage(fn, *args):
+        try:
+            df2, summary = fn(*args)
+            job["log"].append("✅ " + (summary or "Nothing pending — skipped."))
+            return df2
+        except Exception as e:
+            job["log"].append(f"⚠️ Failed: {e}")
+            return args[0]  # keep whatever partial work landed in df
+
+    try:
+        df = ensure_schema(pd.read_csv(DB_FILE)) if os.path.exists(DB_FILE) else ensure_schema(pd.DataFrame())
+
+        begin(1, "Google-searching missing Instagrams")
+        if apify_token:
+            df = run_stage(core_scrape_google, df, load_json_set(SCRAPED_GOOGLES_FILE), apify_token, report)
+            save_db(df)
+        else:
+            job["log"].append("⏭️ Skipped — Apify token missing (add it in Settings).")
+
+        begin(2, "Scraping Instagram bios & emails")
+        if apify_token:
+            df = run_stage(core_scrape_instagram, df, load_json_set(SCRAPED_IGS_FILE), apify_token, report)
+            save_db(df)
+        else:
+            job["log"].append("⏭️ Skipped — Apify token missing (add it in Settings).")
+
+        begin(3, "Cleaning names & titles")
+        if gemini_key:
+            df = run_stage(core_clean_names, df, gemini_key, report)
+            save_db(df)
+        else:
+            job["log"].append("⏭️ Skipped — Gemini key missing (add it in Settings).")
+
+        job["stage"] = "Backing up to GitHub"
+        job["detail"] = ""
+        try:
+            if _cloud_sync_core():
+                job["log"].append("☁️ Saved everything to GitHub.")
+        except Exception as e:
+            job["log"].append(f"☁️⚠️ Cloud save failed: {_cloud_err_msg(e)}")
+    except Exception as e:
+        job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        job["running"] = False
+        job["finished"] = time.time()
+
+def start_full_pipeline():
+    job = _pipeline_job()
+    if job["running"]:
+        return False
+    job.update({"running": True, "stage": "Starting...", "detail": "", "frac": 0.0,
+                "log": [], "error": None, "started": time.time(), "finished": 0.0})
+    threading.Thread(
+        target=run_full_pipeline,
+        args=(job, get_key("APIFY_API_TOKEN"), get_key("GEMINI_API_KEY")),
+        daemon=True,
+    ).start()
+    return True
+
+@st.fragment(run_every=2.0)
+def _pipeline_status_live():
+    """Auto-refreshing status card. When the job ends, refresh the whole page."""
+    job = _pipeline_job()
+    if job["running"]:
+        st.progress(min(1.0, max(0.0, float(job.get("frac") or 0.0))))
+        st.info(f"**{job.get('stage') or 'Working...'}**  \n{job.get('detail') or ''}")
+        st.caption("🟢 Running on the server — you can close this tab and come back anytime.")
+    else:
+        st.rerun(scope="app")
+
+def render_pipeline_box():
+    job = _pipeline_job()
+    with st.container(border=True):
+        st.subheader("2 · Run everything (one click)")
+        st.caption("Finds missing Instagrams, scrapes bios & emails, then cleans names and titles — "
+                   "in that order, automatically. It runs on the server, so once it starts you can "
+                   "close the browser and come back when it's done.")
+        if job["running"]:
+            _pipeline_status_live()
+            return
+        if job.get("finished"):
+            when = time.strftime("%H:%M", time.localtime(job["finished"]))
+            with st.expander(f"Last run · finished {when}"):
+                for line in job["log"]:
+                    st.write(line)
+                if job.get("error"):
+                    st.error(f"Run crashed: {job['error']}")
+        missing = [lbl for k, lbl in [("APIFY_API_TOKEN", "Apify"), ("GEMINI_API_KEY", "Gemini")] if not get_key(k)]
+        if missing:
+            st.warning("Missing API keys: " + ", ".join(missing) + " — those steps would be skipped. Add them in Settings.")
+        if st.button("🚀 Run everything", type="primary", width="stretch"):
+            start_full_pipeline()
+            st.rerun()
+
+# ----------------------------------------------------------------------------
 # State init (runs on every rerun)
 # ----------------------------------------------------------------------------
 cloud_restore_on_boot()  # fresh container -> pull saved data back from GitHub first
@@ -1644,124 +1762,6 @@ def core_clean_names(df, gemini_key, report):
         return df, f"Cleaned {cleaned} names; {errors} failed and stayed pending for retry. Last error: {last_error}"
     return df, f"Cleaned names for {cleaned} leads with {model}."
 
-# ----------------------------------------------------------------------------
-# One-click pipeline — Google-search IGs -> scrape bios -> clean names, in a
-# background thread on the server. The job keeps running after the browser
-# tab is closed; progress lives in shared state that any session can read.
-# ----------------------------------------------------------------------------
-@st.cache_resource
-def _pipeline_job():
-    """Shared job state: survives reruns, page switches, and closed tabs."""
-    return {"running": False, "stage": "", "detail": "", "frac": 0.0,
-            "log": [], "error": None, "started": 0.0, "finished": 0.0}
-
-def run_full_pipeline(job, apify_token, gemini_key):
-    """Background worker. Must never touch st.session_state or draw UI.
-    Reads the database from disk, saves after every stage, then cloud-syncs."""
-    def report(frac, text):
-        job["frac"] = float(min(1.0, max(0.0, frac)))
-        job["detail"] = str(text)
-
-    def begin(n, name):
-        job["stage"] = f"Step {n}/3 · {name}"
-        job["frac"] = 0.0
-        job["detail"] = ""
-        job["log"].append(f"▶ {name}")
-
-    def run_stage(fn, *args):
-        try:
-            df2, summary = fn(*args)
-            job["log"].append("✅ " + (summary or "Nothing pending — skipped."))
-            return df2
-        except Exception as e:
-            job["log"].append(f"⚠️ Failed: {e}")
-            return args[0]  # keep whatever partial work landed in df
-
-    try:
-        df = ensure_schema(pd.read_csv(DB_FILE)) if os.path.exists(DB_FILE) else ensure_schema(pd.DataFrame())
-
-        begin(1, "Google-searching missing Instagrams")
-        if apify_token:
-            df = run_stage(core_scrape_google, df, load_json_set(SCRAPED_GOOGLES_FILE), apify_token, report)
-            save_db(df)
-        else:
-            job["log"].append("⏭️ Skipped — Apify token missing (add it in Settings).")
-
-        begin(2, "Scraping Instagram bios & emails")
-        if apify_token:
-            df = run_stage(core_scrape_instagram, df, load_json_set(SCRAPED_IGS_FILE), apify_token, report)
-            save_db(df)
-        else:
-            job["log"].append("⏭️ Skipped — Apify token missing (add it in Settings).")
-
-        begin(3, "Cleaning names & titles")
-        if gemini_key:
-            df = run_stage(core_clean_names, df, gemini_key, report)
-            save_db(df)
-        else:
-            job["log"].append("⏭️ Skipped — Gemini key missing (add it in Settings).")
-
-        job["stage"] = "Backing up to GitHub"
-        job["detail"] = ""
-        try:
-            if _cloud_sync_core():
-                job["log"].append("☁️ Saved everything to GitHub.")
-        except Exception as e:
-            job["log"].append(f"☁️⚠️ Cloud save failed: {_cloud_err_msg(e)}")
-    except Exception as e:
-        job["error"] = f"{type(e).__name__}: {e}"
-    finally:
-        job["running"] = False
-        job["finished"] = time.time()
-
-def start_full_pipeline():
-    job = _pipeline_job()
-    if job["running"]:
-        return False
-    job.update({"running": True, "stage": "Starting...", "detail": "", "frac": 0.0,
-                "log": [], "error": None, "started": time.time(), "finished": 0.0})
-    threading.Thread(
-        target=run_full_pipeline,
-        args=(job, get_key("APIFY_API_TOKEN"), get_key("GEMINI_API_KEY")),
-        daemon=True,
-    ).start()
-    return True
-
-@st.fragment(run_every=2.0)
-def _pipeline_status_live():
-    """Auto-refreshing status card. When the job ends, refresh the whole page."""
-    job = _pipeline_job()
-    if job["running"]:
-        st.progress(min(1.0, max(0.0, float(job.get("frac") or 0.0))))
-        st.info(f"**{job.get('stage') or 'Working...'}**  \n{job.get('detail') or ''}")
-        st.caption("🟢 Running on the server — you can close this tab and come back anytime.")
-    else:
-        st.rerun(scope="app")
-
-def render_pipeline_box():
-    job = _pipeline_job()
-    with st.container(border=True):
-        st.subheader("2 · Run everything (one click)")
-        st.caption("Finds missing Instagrams, scrapes bios & emails, then cleans names and titles — "
-                   "in that order, automatically. It runs on the server, so once it starts you can "
-                   "close the browser and come back when it's done.")
-        if job["running"]:
-            _pipeline_status_live()
-            return
-        if job.get("finished"):
-            when = time.strftime("%H:%M", time.localtime(job["finished"]))
-            with st.expander(f"Last run · finished {when}"):
-                for line in job["log"]:
-                    st.write(line)
-                if job.get("error"):
-                    st.error(f"Run crashed: {job['error']}")
-        missing = [lbl for k, lbl in [("APIFY_API_TOKEN", "Apify"), ("GEMINI_API_KEY", "Gemini")] if not get_key(k)]
-        if missing:
-            st.warning("Missing API keys: " + ", ".join(missing) + " — those steps would be skipped. Add them in Settings.")
-        if st.button("🚀 Run everything", type="primary", width="stretch"):
-            start_full_pipeline()
-            st.rerun()
-
 # ============================================================================
 # PAGE: Write
 # ============================================================================
@@ -2423,8 +2423,11 @@ nav.run()
 # Keep scroll position — Streamlit rebuilds the page (and the leads table) on
 # every edit, which normally throws you back to the top. This invisible script
 # remembers where you were, per page, and puts you back there after each rerun.
+# Wrapped defensively: if a future Streamlit removes this API, the app keeps
+# working and only the scroll-restore quietly turns off.
 # ----------------------------------------------------------------------------
-components.html("""
+try:
+    components.html("""
 <script>
 (function () {
   try {
@@ -2488,6 +2491,8 @@ components.html("""
 })();
 </script>
 """, height=0)
+except Exception:
+    pass  # scroll restore unavailable — never block the app over it
 
 # ----------------------------------------------------------------------------
 # Cloud save — runs after the page so it captures everything this run changed.
