@@ -1,5 +1,5 @@
 streamlit
-pandas==2.3.2
+pandas
 google-api-python-client
 apify-client
 google-genai>=1.0.0
