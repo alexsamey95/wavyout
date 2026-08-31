@@ -9,12 +9,16 @@ Artist-AI-Outreach apps.
 
 import io
 import os
+import base64
+import hashlib
 import html as html_escape
 import uuid
 import re
 import json
 import time
 import zipfile
+import urllib.request
+import urllib.error
 from urllib.parse import quote
 
 import pandas as pd
@@ -224,6 +228,224 @@ def load_last_playlist():
 def save_last_playlist(url):
     with open(LAST_PLAYLIST_FILE, "w") as f:
         f.write(url)
+
+# ----------------------------------------------------------------------------
+# Cloud save — keeps the database + memory files on a GitHub branch so they
+# survive Streamlit Cloud reboots (this app's local disk is temporary).
+#
+# One-time setup:
+#   1. On GitHub: Settings → Developer settings → Fine-grained tokens →
+#      new token with access to ONLY this repo, permission Contents: Read & write.
+#   2. On Streamlit Cloud: App → Settings → Secrets → add
+#         GITHUB_TOKEN = "github_pat_..."
+# The app then auto-saves every change to the `app-data` branch and restores
+# everything on boot. Saving to a separate branch keeps your data out of the
+# code and, importantly, does NOT trigger a redeploy (Streamlit watches main).
+# Optional secrets: GITHUB_REPO ("owner/name"), GITHUB_DATA_BRANCH.
+# ----------------------------------------------------------------------------
+PERSIST_FILES = [DB_FILE, SEEN_VIDEOS_FILE, BLACKLIST_FILE, LAST_PLAYLIST_FILE,
+                 SCRAPED_IGS_FILE, SCRAPED_GOOGLES_FILE]
+CLOUD_STATE_FILE = ".cloud_state.json"     # what we last pushed (md5 + git sha per file)
+CLOUD_RESTORED_MARKER = ".cloud_restored"  # written once per container boot
+
+def _cloud_token():
+    return str(get_secret("GITHUB_TOKEN") or "").strip()
+
+def _cloud_repo():
+    return str(get_secret("GITHUB_REPO") or "alexsamey95/wavyout").strip()
+
+def _cloud_branch():
+    return str(get_secret("GITHUB_DATA_BRANCH") or "app-data").strip()
+
+def cloud_enabled():
+    return bool(_cloud_token())
+
+def _gh_headers(accept="application/vnd.github+json"):
+    return {
+        "Authorization": f"Bearer {_cloud_token()}",
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "wavy-outreach",
+    }
+
+def _gh(method, path, payload=None):
+    req = urllib.request.Request(
+        f"https://api.github.com/{path}",
+        method=method,
+        data=json.dumps(payload).encode("utf-8") if payload is not None else None,
+        headers=_gh_headers(),
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        body = resp.read().decode("utf-8")
+        return json.loads(body) if body else None
+
+def _gh_fetch_raw(path):
+    """Raw bytes of a file on the data branch, or None if it isn't there."""
+    url = (f"https://api.github.com/repos/{_cloud_repo()}/contents/{quote(path)}"
+           f"?ref={quote(_cloud_branch())}")
+    req = urllib.request.Request(url, headers=_gh_headers("application/vnd.github.raw+json"))
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+
+def _git_blob_sha(data):
+    """The sha GitHub assigns a file's content (git blob sha)."""
+    return hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest()
+
+def _ensure_data_branch():
+    repo, branch = _cloud_repo(), _cloud_branch()
+    try:
+        _gh("GET", f"repos/{repo}/branches/{quote(branch)}")
+        return
+    except urllib.error.HTTPError as e:
+        if e.code != 404:
+            raise
+    base = (_gh("GET", f"repos/{repo}") or {}).get("default_branch", "main")
+    ref = _gh("GET", f"repos/{repo}/git/ref/heads/{quote(base)}")
+    _gh("POST", f"repos/{repo}/git/refs",
+        {"ref": f"refs/heads/{branch}", "sha": ref["object"]["sha"]})
+
+def _gh_put_file(path, data, sha):
+    payload = {"message": f"wavy data: update {path}",
+               "content": base64.b64encode(data).decode("ascii"),
+               "branch": _cloud_branch()}
+    if sha:
+        payload["sha"] = sha
+    try:
+        _gh("PUT", f"repos/{_cloud_repo()}/contents/{quote(path)}", payload)
+    except urllib.error.HTTPError as e:
+        if e.code not in (409, 422):
+            raise
+        # Our remembered sha is stale — re-read the real one and retry once.
+        remote = _gh_fetch_raw(path)
+        if remote is None:
+            payload.pop("sha", None)
+        else:
+            payload["sha"] = _git_blob_sha(remote)
+        _gh("PUT", f"repos/{_cloud_repo()}/contents/{quote(path)}", payload)
+
+def _gh_delete_file(path, sha):
+    payload = {"message": f"wavy data: delete {path}",
+               "sha": sha or "", "branch": _cloud_branch()}
+    try:
+        _gh("DELETE", f"repos/{_cloud_repo()}/contents/{quote(path)}", payload)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return  # already gone
+        if e.code not in (409, 422):
+            raise
+        remote = _gh_fetch_raw(path)
+        if remote is None:
+            return
+        payload["sha"] = _git_blob_sha(remote)
+        _gh("DELETE", f"repos/{_cloud_repo()}/contents/{quote(path)}", payload)
+
+def _cloud_state_load():
+    if os.path.exists(CLOUD_STATE_FILE):
+        try:
+            with open(CLOUD_STATE_FILE, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def _cloud_state_save(state):
+    with open(CLOUD_STATE_FILE, "w") as f:
+        json.dump(state, f)
+
+def _cloud_err_msg(e):
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 401:
+            return "GitHub token is invalid or expired — update GITHUB_TOKEN in the app secrets."
+        if e.code == 403:
+            return "GitHub token lacks permission — it needs Contents: Read and write on the repo."
+        if e.code == 404:
+            return (f"GitHub repo `{_cloud_repo()}` not found or the token can't see it — "
+                    "check GITHUB_REPO / the token's repository access.")
+        return f"GitHub error {e.code}"
+    return str(e) or type(e).__name__
+
+def cloud_pending_count():
+    """How many data files differ from what's saved on GitHub."""
+    state = _cloud_state_load()
+    n = 0
+    for path in PERSIST_FILES:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                if state.get(path, {}).get("md5") != hashlib.md5(f.read()).hexdigest():
+                    n += 1
+        elif path in state:
+            n += 1
+    return n
+
+def cloud_sync():
+    """Push every locally-changed data file to GitHub. Returns (pushed, error)."""
+    if not cloud_enabled():
+        return 0, None
+    try:
+        if not st.session_state.get("_cloud_branch_ok"):
+            _ensure_data_branch()
+            st.session_state["_cloud_branch_ok"] = True
+        state = _cloud_state_load()
+        pushed = 0
+        for path in PERSIST_FILES:
+            if os.path.exists(path):
+                with open(path, "rb") as f:
+                    data = f.read()
+                digest = hashlib.md5(data).hexdigest()
+                if state.get(path, {}).get("md5") == digest:
+                    continue
+                _gh_put_file(path, data, state.get(path, {}).get("sha"))
+                state[path] = {"md5": digest, "sha": _git_blob_sha(data)}
+                pushed += 1
+            elif path in state:
+                _gh_delete_file(path, state[path].get("sha"))
+                del state[path]
+                pushed += 1
+        if pushed:
+            _cloud_state_save(state)
+            st.session_state["_cloud_last_sync"] = time.time()
+        st.session_state["_cloud_error"] = None
+        return pushed, None
+    except Exception as e:
+        msg = _cloud_err_msg(e)
+        st.session_state["_cloud_error"] = msg
+        return 0, msg
+
+def cloud_restore_on_boot():
+    """On a fresh container, pull the data files back down from GitHub.
+    Never overwrites a file that already exists locally, and never raises."""
+    if not cloud_enabled() or os.path.exists(CLOUD_RESTORED_MARKER):
+        return
+    try:
+        _ensure_data_branch()
+        st.session_state["_cloud_branch_ok"] = True
+        state = _cloud_state_load()
+        restored = 0
+        for path in PERSIST_FILES:
+            if os.path.exists(path):
+                continue
+            data = _gh_fetch_raw(path)
+            if data is None:
+                continue
+            with open(path, "wb") as f:
+                f.write(data)
+            state[path] = {"md5": hashlib.md5(data).hexdigest(),
+                           "sha": _git_blob_sha(data)}
+            restored += 1
+        _cloud_state_save(state)
+        if restored:
+            st.toast(f"☁️ Restored {restored} data file(s) from GitHub.")
+    except Exception as e:
+        st.warning(f"Could not restore data from GitHub ({_cloud_err_msg(e)}). "
+                   "Starting with what's on disk.")
+    finally:
+        with open(CLOUD_RESTORED_MARKER, "w") as f:
+            f.write(str(time.time()))
 
 # ----------------------------------------------------------------------------
 # Parsing helpers
@@ -692,6 +914,8 @@ def enrich_targets(df, scraped_igs, scraped_googles):
 # ----------------------------------------------------------------------------
 # State init (runs on every rerun)
 # ----------------------------------------------------------------------------
+cloud_restore_on_boot()  # fresh container -> pull saved data back from GitHub first
+
 if "df" not in st.session_state:
     st.session_state.df = load_db()
 
@@ -1820,7 +2044,17 @@ def page_settings():
     # ---- Backup & restore ---------------------------------------------------
     with st.container(border=True):
         st.subheader("Backup & restore")
-        st.caption("Streamlit Cloud wipes this app's disk whenever it restarts. Download a backup after every session; restore it here when the data disappears.")
+        if cloud_enabled():
+            st.caption(f"☁️ Cloud save is ON — every change is auto-saved to the `{_cloud_branch()}` "
+                       f"branch of `{_cloud_repo()}` on GitHub and restored whenever the app reboots. "
+                       "Downloading a backup below is an optional extra safety net.")
+        else:
+            st.caption("☁️ Cloud save is OFF, and Streamlit Cloud wipes this app's disk whenever it "
+                       "restarts. To keep your data automatically: on GitHub create a fine-grained "
+                       "token (Settings → Developer settings → Fine-grained tokens) with access to "
+                       "only this repo and permission **Contents: Read and write**, then on Streamlit "
+                       "Cloud add it under App → Settings → Secrets as `GITHUB_TOKEN = \"github_pat_...\"` "
+                       "and reboot. Until then, download a backup after every session and restore it here.")
         df = st.session_state.df
         st.download_button(
             "📥 Download full backup (.zip)",
@@ -1961,3 +2195,32 @@ with st.sidebar:
     st.caption(dots)
 
 nav.run()
+
+# ----------------------------------------------------------------------------
+# Cloud save — runs after the page so it captures everything this run changed.
+# ----------------------------------------------------------------------------
+if cloud_enabled():
+    cloud_sync()
+
+with st.sidebar:
+    st.divider()
+    if cloud_enabled():
+        _cloud_err = st.session_state.get("_cloud_error")
+        _pending = cloud_pending_count()
+        if _cloud_err:
+            st.caption(f"☁️⚠️ Cloud save error: {_cloud_err}")
+        elif _pending:
+            st.caption(f"☁️ {_pending} change(s) waiting to save")
+        else:
+            _ts = st.session_state.get("_cloud_last_sync")
+            _when = f" · {time.strftime('%H:%M', time.localtime(_ts))}" if _ts else ""
+            st.caption(f"☁️ All changes saved to GitHub{_when}")
+        if st.button("💾 Save to cloud now", use_container_width=True):
+            _n, _err = cloud_sync()
+            if _err:
+                st.error(_err)
+            else:
+                st.toast("Saved to GitHub ✓" if _n else "Already up to date ✓")
+    else:
+        st.caption("☁️ Cloud save is OFF — data is lost when the app reboots. "
+                   "Add a `GITHUB_TOKEN` secret to turn it on (see Settings → Backup).")
