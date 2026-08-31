@@ -156,7 +156,7 @@ def ensure_schema(df):
     legacy_reached = legacy_reached.map(lambda v: str(v).strip().lower() == "true" if not isinstance(v, bool) else v).fillna(False).astype(bool)
     orphan = legacy_reached & ~df["Emailed"] & ~df["DM'd"]
     if orphan.any():
-        has_email = df["Email Address"].apply(is_valid_data)
+        has_email = df["Email Address"].apply(is_valid_data).astype(bool)
         df.loc[orphan & has_email, "Emailed"] = True
         df.loc[orphan & ~has_email, "DM'd"] = True
         carry = df["Reached_Out_Date"] if "Reached_Out_Date" in df.columns else pd.Series(pd.NaT, index=df.index)
@@ -165,8 +165,8 @@ def ensure_schema(df):
     # Reached Out ticks only when EVERY available channel has been used:
     # (has email -> emailed) AND (has IG -> DM'd) AND at least one touch.
     touched = df["Emailed"] | df["DM'd"]
-    _has_em = df["Email Address"].apply(is_valid_data)
-    _has_ig = df["Instagram"].apply(is_valid_data)
+    _has_em = df["Email Address"].apply(is_valid_data).astype(bool)
+    _has_ig = df["Instagram"].apply(is_valid_data).astype(bool)
     df["Reached Out"] = touched & (~_has_em | df["Emailed"]) & (~_has_ig | df["DM'd"])
 
     # Old "[Claude Error]" strings must never block regeneration
@@ -177,7 +177,7 @@ def ensure_schema(df):
         lambda x: str(x).split(",")[0].strip() if is_valid_data(x) else "None"
     )
 
-    needs_qs = ~df["🔍 Quick Search"].apply(is_valid_data)
+    needs_qs = ~df["🔍 Quick Search"].apply(is_valid_data).astype(bool)
     if needs_qs.any():
         df.loc[needs_qs, "🔍 Quick Search"] = df.loc[needs_qs, "Channel Name"].apply(quick_search_url)
 
@@ -1677,10 +1677,10 @@ def page_leads():
         )
         filtered_df = filtered_df[mask]
 
-    if email_filter == "Has email": filtered_df = filtered_df[filtered_df["Email Address"].apply(is_valid_data)]
-    elif email_filter == "No email": filtered_df = filtered_df[~filtered_df["Email Address"].apply(is_valid_data)]
-    if ig_filter == "Has IG": filtered_df = filtered_df[filtered_df["Instagram"].apply(is_valid_data)]
-    elif ig_filter == "No IG": filtered_df = filtered_df[~filtered_df["Instagram"].apply(is_valid_data)]
+    if email_filter == "Has email": filtered_df = filtered_df[filtered_df["Email Address"].apply(is_valid_data).astype(bool)]
+    elif email_filter == "No email": filtered_df = filtered_df[~filtered_df["Email Address"].apply(is_valid_data).astype(bool)]
+    if ig_filter == "Has IG": filtered_df = filtered_df[filtered_df["Instagram"].apply(is_valid_data).astype(bool)]
+    elif ig_filter == "No IG": filtered_df = filtered_df[~filtered_df["Instagram"].apply(is_valid_data).astype(bool)]
     if crm_filter == "Not contacted": filtered_df = filtered_df[filtered_df["Reached Out"] == False]
     elif crm_filter == "Contacted": filtered_df = filtered_df[(filtered_df["Reached Out"] == True) & (filtered_df["Replied"] == False)]
     elif crm_filter == "Emailed": filtered_df = filtered_df[filtered_df["Emailed"] == True]
@@ -1850,7 +1850,7 @@ def page_settings():
                     added = len(incoming)
                 else:
                     current = st.session_state.df
-                    if incoming["Channel_ID"].apply(is_valid_data).any() and current["Channel_ID"].apply(is_valid_data).any():
+                    if incoming["Channel_ID"].apply(is_valid_data).astype(bool).any() and current["Channel_ID"].apply(is_valid_data).astype(bool).any():
                         existing = set(current["Channel_ID"])
                         incoming = incoming[~incoming["Channel_ID"].isin(existing)]
                     else:
