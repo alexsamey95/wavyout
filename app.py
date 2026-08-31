@@ -16,6 +16,7 @@ import uuid
 import re
 import json
 import time
+import threading
 import zipfile
 import urllib.request
 import urllib.error
@@ -379,32 +380,44 @@ def cloud_pending_count():
             n += 1
     return n
 
+CLOUD_BRANCH_MARKER = ".cloud_branch_ok"  # data branch verified once per container
+
+def _cloud_sync_core():
+    """Session-free sync core — safe to call from background threads.
+    Pushes every locally-changed data file to GitHub. Returns files pushed."""
+    if not cloud_enabled():
+        return 0
+    if not os.path.exists(CLOUD_BRANCH_MARKER):
+        _ensure_data_branch()
+        with open(CLOUD_BRANCH_MARKER, "w") as f:
+            f.write("ok")
+    state = _cloud_state_load()
+    pushed = 0
+    for path in PERSIST_FILES:
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                data = f.read()
+            digest = hashlib.md5(data).hexdigest()
+            if state.get(path, {}).get("md5") == digest:
+                continue
+            _gh_put_file(path, data, state.get(path, {}).get("sha"))
+            state[path] = {"md5": digest, "sha": _git_blob_sha(data)}
+            pushed += 1
+        elif path in state:
+            _gh_delete_file(path, state[path].get("sha"))
+            del state[path]
+            pushed += 1
+    if pushed:
+        _cloud_state_save(state)
+    return pushed
+
 def cloud_sync():
-    """Push every locally-changed data file to GitHub. Returns (pushed, error)."""
+    """UI wrapper around the sync core. Returns (pushed, error_message)."""
     if not cloud_enabled():
         return 0, None
     try:
-        if not st.session_state.get("_cloud_branch_ok"):
-            _ensure_data_branch()
-            st.session_state["_cloud_branch_ok"] = True
-        state = _cloud_state_load()
-        pushed = 0
-        for path in PERSIST_FILES:
-            if os.path.exists(path):
-                with open(path, "rb") as f:
-                    data = f.read()
-                digest = hashlib.md5(data).hexdigest()
-                if state.get(path, {}).get("md5") == digest:
-                    continue
-                _gh_put_file(path, data, state.get(path, {}).get("sha"))
-                state[path] = {"md5": digest, "sha": _git_blob_sha(data)}
-                pushed += 1
-            elif path in state:
-                _gh_delete_file(path, state[path].get("sha"))
-                del state[path]
-                pushed += 1
+        pushed = _cloud_sync_core()
         if pushed:
-            _cloud_state_save(state)
             st.session_state["_cloud_last_sync"] = time.time()
         st.session_state["_cloud_error"] = None
         return pushed, None
@@ -420,7 +433,8 @@ def cloud_restore_on_boot():
         return
     try:
         _ensure_data_branch()
-        st.session_state["_cloud_branch_ok"] = True
+        with open(CLOUD_BRANCH_MARKER, "w") as f:
+            f.write("ok")
         state = _cloud_state_load()
         restored = 0
         for path in PERSIST_FILES:
@@ -541,7 +555,10 @@ def resolve_gemini_model(client):
     Google retires model names regularly (1.5 -> 2.5 -> 3.x). Try the preferred
     model first; if it's gone, discover a current Flash model from the API's
     own model list. The result is cached for the session."""
-    cached = st.session_state.get("_gemini_model")
+    try:
+        cached = st.session_state.get("_gemini_model")
+    except Exception:
+        cached = None  # running in a background thread — no session cache
     if cached:
         return cached
 
@@ -560,7 +577,10 @@ def resolve_gemini_model(client):
     for cand in candidates:
         try:
             client.models.generate_content(model=cand, contents="ok")
-            st.session_state["_gemini_model"] = cand
+            try:
+                st.session_state["_gemini_model"] = cand
+            except Exception:
+                pass  # background thread — skip the session cache
             return cand
         except Exception as e:
             msg = str(e).lower()
@@ -703,7 +723,7 @@ def merge_message_csv(df, incoming):
 # ----------------------------------------------------------------------------
 # Apify helper
 # ----------------------------------------------------------------------------
-def run_apify_and_poll(client, actor_id, run_input, total_targets, progress_bar, status_text, label):
+def run_apify_and_poll(client, actor_id, run_input, total_targets, report, label):
     """Start an Apify actor and poll until it finishes. Returns (status, dataset_id)."""
     run_obj = client.actor(actor_id).start(run_input=run_input)
 
@@ -729,8 +749,7 @@ def run_apify_and_poll(client, actor_id, run_input, total_targets, progress_bar,
 
         elapsed = int(time.time() - start_time)
         progress_val = min(0.95, item_count / total_targets) if total_targets > 0 else 0.5
-        progress_bar.progress(progress_val)
-        status_text.info(f"{label}: {item_count}/{total_targets} done · {elapsed}s · {status}")
+        report(progress_val, f"{label}: {item_count}/{total_targets} done · {elapsed}s · {status}")
 
         if status in ["SUCCEEDED", "FAILED", "TIMED-OUT", "ABORTED"]:
             break
@@ -909,8 +928,14 @@ def enrich_targets(df, scraped_igs, scraped_googles):
 # ----------------------------------------------------------------------------
 cloud_restore_on_boot()  # fresh container -> pull saved data back from GitHub first
 
+_job_boot = _pipeline_job()
 if "df" not in st.session_state:
     st.session_state.df = load_db()
+    st.session_state["_df_loaded_at"] = time.time()
+elif (not _job_boot["running"]) and _job_boot.get("finished", 0) > st.session_state.get("_df_loaded_at", 0):
+    # A background pipeline finished since this tab last loaded — pick up its results
+    st.session_state.df = load_db()
+    st.session_state["_df_loaded_at"] = time.time()
 
 seen_videos = load_json_set(SEEN_VIDEOS_FILE)
 blacklist = load_json_set(BLACKLIST_FILE)
@@ -1270,6 +1295,7 @@ def page_collect():
     st.caption("Pull artists from a YouTube playlist, then enrich them with Instagram and Google data.")
 
     df = st.session_state.df
+    pipeline_running = _pipeline_job()["running"]
 
     # ---- Step 1: Sync playlist -------------------------------------------
     with st.container(border=True):
@@ -1279,7 +1305,8 @@ def page_collect():
             value=load_last_playlist(),
             placeholder="https://www.youtube.com/playlist?list=PL...",
         )
-        if st.button("Sync playlist", type="primary"):
+        if st.button("Sync playlist", type="primary", disabled=pipeline_running,
+                      help="Locked while the one-click pipeline is running." if pipeline_running else None):
             yt_key = get_key("YOUTUBE_API_KEY")
             if not yt_key:
                 st.error("YouTube API key is missing. Add it in Settings.")
@@ -1289,22 +1316,25 @@ def page_collect():
                 save_last_playlist(playlist_input)
                 sync_playlist(playlist_input, yt_key)
 
-    # ---- Step 2: Enrich with Apify ---------------------------------------
+    # ---- Step 2: One-click pipeline ---------------------------------------
+    render_pipeline_box()
+
+    # ---- Step 3: Enrich manually ------------------------------------------
     ig_pending, google_pending = enrich_targets(df, scraped_igs, scraped_googles)
     with st.container(border=True):
-        st.subheader("2 · Enrich")
+        st.subheader("3 · Or run each step yourself")
         if not get_key("APIFY_API_TOKEN"):
             st.warning("Apify token is missing — add it in Settings to enable enrichment.")
         c1, c2 = st.columns(2)
         with c1:
             st.markdown("**Scrape Instagram bios**")
             st.caption(f"Pulls bio, follower count, and emails. {ig_pending} profiles pending.")
-            if st.button("Scrape Instagram bios", disabled=(ig_pending == 0 or not get_key("APIFY_API_TOKEN"))):
+            if st.button("Scrape Instagram bios", disabled=(ig_pending == 0 or not get_key("APIFY_API_TOKEN") or pipeline_running)):
                 scrape_instagram()
         with c2:
             st.markdown("**Find missing Instagrams**")
             st.caption(f"Googles each artist for a profile link. {google_pending} artists pending.")
-            if st.button("Search Google for IGs", disabled=(google_pending == 0 or not get_key("APIFY_API_TOKEN"))):
+            if st.button("Search Google for IGs", disabled=(google_pending == 0 or not get_key("APIFY_API_TOKEN") or pipeline_running)):
                 scrape_google()
 
 def sync_playlist(playlist_input, yt_key):
@@ -1411,8 +1441,11 @@ def sync_playlist(playlist_input, yt_key):
     flash("success", f"Added {len(new_channels_data)} new artists from {new_videos_found} new videos.")
     st.rerun()
 
-def scrape_instagram():
-    df = st.session_state.df
+def core_scrape_instagram(df, igs_set, token, report):
+    """Scrape IG bios/followers/emails for pending profiles. Session-free so it
+    can run in a background thread. Mutates df in place, saves the memory set,
+    and returns (df, summary) — summary is None when there was nothing to do.
+    Raises RuntimeError if the Apify run does not succeed."""
     target_usernames, idx_mapping = [], {}
 
     for idx in df.index:
@@ -1421,7 +1454,7 @@ def scrape_instagram():
            and (not is_valid_data(df.loc[idx, "Email Address"]) or safe_int(df.loc[idx, "IG Followers"]) <= 0):
             ig_url = ig_val.split(",")[0].strip().rstrip("/")
             ig_url_lower = ig_url.lower()
-            if ig_url_lower not in scraped_igs:
+            if ig_url_lower not in igs_set:
                 username = extract_ig_username(ig_url)
                 username_lower = username.lower()
                 if username_lower not in idx_mapping:
@@ -1430,68 +1463,80 @@ def scrape_instagram():
                 idx_mapping[username_lower]["indices"].append(idx)
 
     if not target_usernames:
-        st.info("No unscanned Instagram profiles found.")
-        return
+        return df, None
 
+    report(0.0, f"Starting Apify job for {len(target_usernames)} Instagram profiles...")
+    from apify_client import ApifyClient
+    client = ApifyClient(token)
+    status, dataset_id = run_apify_and_poll(
+        client, "apify/instagram-profile-scraper",
+        {"usernames": target_usernames},
+        len(target_usernames), report, "Scraping Instagram",
+    )
+    if status != "SUCCEEDED":
+        raise RuntimeError(f"Apify run ended with status: {status}")
+
+    report(0.98, "Saving results to your leads...")
+    emails_found, profiles_scraped = 0, 0
+    for item in client.dataset(dataset_id).iterate_items():
+        returned_username = str(item.get("username", "")).lower()
+        if returned_username in idx_mapping:
+            mapped = idx_mapping[returned_username]
+            bio_text = str(item.get("biography", ""))
+            followers_count = safe_int(item.get("followersCount", 0))
+
+            emails = extract_emails(bio_text)
+            if item.get("public_email"): emails.append(item["public_email"])
+            if item.get("business_email"): emails.append(item["business_email"])
+            clean_emails = [e for e in emails if "example" not in e.lower()]
+            found_email = ", ".join(set(clean_emails)) if clean_emails else "None Found"
+
+            for i in mapped["indices"]:
+                if i not in df.index:
+                    continue
+                df.loc[i, "IG Bio"] = bio_text if bio_text.strip() else "Empty Bio"
+                df.loc[i, "IG Followers"] = followers_count
+                if found_email != "None Found" and not is_valid_data(df.loc[i, "Email Address"]):
+                    df.loc[i, "Email Address"] = found_email
+                    emails_found += 1
+
+            igs_set.add(mapped["url"])
+            profiles_scraped += 1
+
+    save_json_set(igs_set, SCRAPED_IGS_FILE)
+    return df, f"Scraped {profiles_scraped} Instagram bios and found {emails_found} new emails."
+
+def scrape_instagram():
     progress_bar = st.progress(0.0)
     status_text = st.empty()
-    status_text.info(f"Starting Apify job for {len(target_usernames)} Instagram profiles...")
-
+    def report(frac, text):
+        progress_bar.progress(min(1.0, max(0.0, float(frac))))
+        status_text.info(text)
+    summary, ok = None, False
     try:
-        from apify_client import ApifyClient
-        client = ApifyClient(get_key("APIFY_API_TOKEN"))
-        status, dataset_id = run_apify_and_poll(
-            client, "apify/instagram-profile-scraper",
-            {"usernames": target_usernames},
-            len(target_usernames), progress_bar, status_text, "Scraping Instagram",
-        )
-        if status != "SUCCEEDED":
-            status_text.error(f"Apify run ended with status: {status}")
+        df, summary = core_scrape_instagram(st.session_state.df, scraped_igs, get_key("APIFY_API_TOKEN"), report)
+        if summary is None:
+            st.info("No unscanned Instagram profiles found.")
             return
-
-        status_text.info("Saving results to your leads...")
-        emails_found, profiles_scraped = 0, 0
-        for item in client.dataset(dataset_id).iterate_items():
-            returned_username = str(item.get("username", "")).lower()
-            if returned_username in idx_mapping:
-                mapped = idx_mapping[returned_username]
-                bio_text = str(item.get("biography", ""))
-                followers_count = safe_int(item.get("followersCount", 0))
-
-                emails = extract_emails(bio_text)
-                if item.get("public_email"): emails.append(item["public_email"])
-                if item.get("business_email"): emails.append(item["business_email"])
-                clean_emails = [e for e in emails if "example" not in e.lower()]
-                found_email = ", ".join(set(clean_emails)) if clean_emails else "None Found"
-
-                for i in mapped["indices"]:
-                    if i not in st.session_state.df.index:
-                        continue
-                    st.session_state.df.loc[i, "IG Bio"] = bio_text if bio_text.strip() else "Empty Bio"
-                    st.session_state.df.loc[i, "IG Followers"] = followers_count
-                    if found_email != "None Found" and not is_valid_data(st.session_state.df.loc[i, "Email Address"]):
-                        st.session_state.df.loc[i, "Email Address"] = found_email
-                        emails_found += 1
-
-                scraped_igs.add(mapped["url"])
-                profiles_scraped += 1
-
-        save_json_set(scraped_igs, SCRAPED_IGS_FILE)
+        st.session_state.df = df
         save_db(st.session_state.df)
-        flash("success", f"Scraped {profiles_scraped} Instagram bios and found {emails_found} new emails.")
-        st.rerun()
+        ok = True
     except Exception as e:
         status_text.error(f"Instagram scrape failed: {e}")
+    if ok:
+        flash("success", summary)
+        st.rerun()
 
-def scrape_google():
-    df = st.session_state.df
+def core_scrape_google(df, googles_set, token, report):
+    """Google-search artists with no Instagram yet. Session-free (see above).
+    Returns (df, summary) — summary is None when there was nothing to do."""
     target_queries, idx_mapping = [], {}
 
     for idx in df.index:
         ig_val = str(df.loc[idx, "Instagram"])
         channel_name = str(df.loc[idx, "Channel Name"]).strip()
         channel_lower = channel_name.lower()
-        if not is_valid_data(ig_val) and not google_already_searched(df.loc[idx]) and channel_lower not in scraped_googles:
+        if not is_valid_data(ig_val) and not google_already_searched(df.loc[idx]) and channel_lower not in googles_set:
             search_query = f'"{channel_name}" "instagram.com"'
             query_lower = search_query.lower()
             query_no_quotes = query_lower.replace('"', '')
@@ -1503,55 +1548,219 @@ def scrape_google():
                 idx_mapping[query_lower]["indices"].append(idx)
 
     if not target_queries:
-        st.info("No artists need a Google search right now.")
-        return
+        return df, None
 
+    report(0.0, f"Starting Google search for {len(target_queries)} artists...")
+    from apify_client import ApifyClient
+    client = ApifyClient(token)
+    status, dataset_id = run_apify_and_poll(
+        client, "apify/google-search-scraper",
+        {"queries": "\n".join(target_queries), "maxPagesPerQuery": 1, "resultsPerPage": 10},
+        len(target_queries), report, "Searching Google",
+    )
+    if status != "SUCCEEDED":
+        raise RuntimeError(f"Apify run ended with status: {status}")
+
+    report(0.98, "Saving results to your leads...")
+    igs_found = 0
+    for item in client.dataset(dataset_id).iterate_items():
+        original_query = item.get("searchQuery", {}).get("term", "").lower()
+        if original_query in idx_mapping:
+            mapped = idx_mapping[original_query]
+            organic_results = item.get("organicResults", [])
+            combined = " ".join([r.get("description", r.get("snippet", "")) + " " + r.get("url", "") for r in organic_results])
+            found_ig = extract_instagram(combined)
+
+            for i in mapped["indices"]:
+                if i not in df.index:
+                    continue
+                df.loc[i, "Google Search Status"] = f"Searched ({len(organic_results)} results)"
+                if found_ig != "None" and not is_valid_data(df.loc[i, "Instagram"]):
+                    df.loc[i, "Instagram"] = found_ig
+                    igs_found += 1
+
+    for _, mapped in idx_mapping.items():
+        googles_set.add(mapped["channel"])
+        for i in mapped["indices"]:
+            if i in df.index and not is_valid_data(df.loc[i, "Google Search Status"]):
+                df.loc[i, "Google Search Status"] = "Searched (0 results)"
+
+    save_json_set(googles_set, SCRAPED_GOOGLES_FILE)
+    return df, f"Google search finished — found {igs_found} missing Instagram profiles."
+
+def scrape_google():
     progress_bar = st.progress(0.0)
     status_text = st.empty()
-    status_text.info(f"Starting Google search for {len(target_queries)} artists...")
-
+    def report(frac, text):
+        progress_bar.progress(min(1.0, max(0.0, float(frac))))
+        status_text.info(text)
+    summary, ok = None, False
     try:
-        from apify_client import ApifyClient
-        client = ApifyClient(get_key("APIFY_API_TOKEN"))
-        status, dataset_id = run_apify_and_poll(
-            client, "apify/google-search-scraper",
-            {"queries": "\n".join(target_queries), "maxPagesPerQuery": 1, "resultsPerPage": 10},
-            len(target_queries), progress_bar, status_text, "Searching Google",
-        )
-        if status != "SUCCEEDED":
-            status_text.error(f"Apify run ended with status: {status}")
+        df, summary = core_scrape_google(st.session_state.df, scraped_googles, get_key("APIFY_API_TOKEN"), report)
+        if summary is None:
+            st.info("No artists need a Google search right now.")
             return
-
-        status_text.info("Saving results to your leads...")
-        igs_found = 0
-        for item in client.dataset(dataset_id).iterate_items():
-            original_query = item.get("searchQuery", {}).get("term", "").lower()
-            if original_query in idx_mapping:
-                mapped = idx_mapping[original_query]
-                organic_results = item.get("organicResults", [])
-                combined = " ".join([r.get("description", r.get("snippet", "")) + " " + r.get("url", "") for r in organic_results])
-                found_ig = extract_instagram(combined)
-
-                for i in mapped["indices"]:
-                    if i not in st.session_state.df.index:
-                        continue
-                    st.session_state.df.loc[i, "Google Search Status"] = f"Searched ({len(organic_results)} results)"
-                    if found_ig != "None" and not is_valid_data(st.session_state.df.loc[i, "Instagram"]):
-                        st.session_state.df.loc[i, "Instagram"] = found_ig
-                        igs_found += 1
-
-        for _, mapped in idx_mapping.items():
-            scraped_googles.add(mapped["channel"])
-            for i in mapped["indices"]:
-                if i in st.session_state.df.index and not is_valid_data(st.session_state.df.loc[i, "Google Search Status"]):
-                    st.session_state.df.loc[i, "Google Search Status"] = "Searched (0 results)"
-
-        save_json_set(scraped_googles, SCRAPED_GOOGLES_FILE)
+        st.session_state.df = df
         save_db(st.session_state.df)
-        flash("success", f"Google search finished — found {igs_found} missing Instagram profiles.")
-        st.rerun()
+        ok = True
     except Exception as e:
         status_text.error(f"Google search failed: {e}")
+    if ok:
+        flash("success", summary)
+        st.rerun()
+
+def core_clean_names(df, gemini_key, report):
+    """Clean artist/song names for every pending lead. Session-free (see above).
+    Returns (df, summary) — summary is None when there was nothing to do.
+    Stops (raises) after 3 consecutive Gemini failures; partial work stays in df."""
+    clean_targets, _ = compute_write_targets(df)
+    if not clean_targets:
+        return df, None
+
+    gclient = google_genai.Client(api_key=gemini_key)
+    report(0.0, "Checking which Gemini model your key can use...")
+    model = resolve_gemini_model(gclient)
+    errors, last_error, cleaned, consecutive = 0, "", 0, 0
+    total = len(clean_targets)
+    for pos, idx in enumerate(clean_targets):
+        row = df.loc[idx]
+        report(pos / total, f"Cleaning {row['Channel Name']}... ({pos + 1}/{total})")
+        artist, song, err = clean_with_gemini(gclient, model, row["Channel Name"], row["Song Name"])
+        if err:
+            errors += 1
+            last_error = err
+            consecutive += 1
+            if consecutive >= 3:
+                raise RuntimeError(
+                    f"Gemini failed 3 times in a row after cleaning {cleaned} of {total} leads — "
+                    f"the rest stayed pending for retry. Last error: {last_error}"
+                )
+        else:
+            consecutive = 0
+            cleaned += 1
+            df.loc[idx, "Cleaned Artist"] = artist
+            df.loc[idx, "Cleaned Song"] = song
+    if errors:
+        return df, f"Cleaned {cleaned} names; {errors} failed and stayed pending for retry. Last error: {last_error}"
+    return df, f"Cleaned names for {cleaned} leads with {model}."
+
+# ----------------------------------------------------------------------------
+# One-click pipeline — Google-search IGs -> scrape bios -> clean names, in a
+# background thread on the server. The job keeps running after the browser
+# tab is closed; progress lives in shared state that any session can read.
+# ----------------------------------------------------------------------------
+@st.cache_resource
+def _pipeline_job():
+    """Shared job state: survives reruns, page switches, and closed tabs."""
+    return {"running": False, "stage": "", "detail": "", "frac": 0.0,
+            "log": [], "error": None, "started": 0.0, "finished": 0.0}
+
+def run_full_pipeline(job, apify_token, gemini_key):
+    """Background worker. Must never touch st.session_state or draw UI.
+    Reads the database from disk, saves after every stage, then cloud-syncs."""
+    def report(frac, text):
+        job["frac"] = float(min(1.0, max(0.0, frac)))
+        job["detail"] = str(text)
+
+    def begin(n, name):
+        job["stage"] = f"Step {n}/3 · {name}"
+        job["frac"] = 0.0
+        job["detail"] = ""
+        job["log"].append(f"▶ {name}")
+
+    def run_stage(fn, *args):
+        try:
+            df2, summary = fn(*args)
+            job["log"].append("✅ " + (summary or "Nothing pending — skipped."))
+            return df2
+        except Exception as e:
+            job["log"].append(f"⚠️ Failed: {e}")
+            return args[0]  # keep whatever partial work landed in df
+
+    try:
+        df = ensure_schema(pd.read_csv(DB_FILE)) if os.path.exists(DB_FILE) else ensure_schema(pd.DataFrame())
+
+        begin(1, "Google-searching missing Instagrams")
+        if apify_token:
+            df = run_stage(core_scrape_google, df, load_json_set(SCRAPED_GOOGLES_FILE), apify_token, report)
+            save_db(df)
+        else:
+            job["log"].append("⏭️ Skipped — Apify token missing (add it in Settings).")
+
+        begin(2, "Scraping Instagram bios & emails")
+        if apify_token:
+            df = run_stage(core_scrape_instagram, df, load_json_set(SCRAPED_IGS_FILE), apify_token, report)
+            save_db(df)
+        else:
+            job["log"].append("⏭️ Skipped — Apify token missing (add it in Settings).")
+
+        begin(3, "Cleaning names & titles")
+        if gemini_key:
+            df = run_stage(core_clean_names, df, gemini_key, report)
+            save_db(df)
+        else:
+            job["log"].append("⏭️ Skipped — Gemini key missing (add it in Settings).")
+
+        job["stage"] = "Backing up to GitHub"
+        job["detail"] = ""
+        try:
+            if _cloud_sync_core():
+                job["log"].append("☁️ Saved everything to GitHub.")
+        except Exception as e:
+            job["log"].append(f"☁️⚠️ Cloud save failed: {_cloud_err_msg(e)}")
+    except Exception as e:
+        job["error"] = f"{type(e).__name__}: {e}"
+    finally:
+        job["running"] = False
+        job["finished"] = time.time()
+
+def start_full_pipeline():
+    job = _pipeline_job()
+    if job["running"]:
+        return False
+    job.update({"running": True, "stage": "Starting...", "detail": "", "frac": 0.0,
+                "log": [], "error": None, "started": time.time(), "finished": 0.0})
+    threading.Thread(
+        target=run_full_pipeline,
+        args=(job, get_key("APIFY_API_TOKEN"), get_key("GEMINI_API_KEY")),
+        daemon=True,
+    ).start()
+    return True
+
+@st.fragment(run_every=2.0)
+def _pipeline_status_live():
+    """Auto-refreshing status card. When the job ends, refresh the whole page."""
+    job = _pipeline_job()
+    if job["running"]:
+        st.progress(min(1.0, max(0.0, float(job.get("frac") or 0.0))))
+        st.info(f"**{job.get('stage') or 'Working...'}**  \n{job.get('detail') or ''}")
+        st.caption("🟢 Running on the server — you can close this tab and come back anytime.")
+    else:
+        st.rerun(scope="app")
+
+def render_pipeline_box():
+    job = _pipeline_job()
+    with st.container(border=True):
+        st.subheader("2 · Run everything (one click)")
+        st.caption("Finds missing Instagrams, scrapes bios & emails, then cleans names and titles — "
+                   "in that order, automatically. It runs on the server, so once it starts you can "
+                   "close the browser and come back when it's done.")
+        if job["running"]:
+            _pipeline_status_live()
+            return
+        if job.get("finished"):
+            when = time.strftime("%H:%M", time.localtime(job["finished"]))
+            with st.expander(f"Last run · finished {when}"):
+                for line in job["log"]:
+                    st.write(line)
+                if job.get("error"):
+                    st.error(f"Run crashed: {job['error']}")
+        missing = [lbl for k, lbl in [("APIFY_API_TOKEN", "Apify"), ("GEMINI_API_KEY", "Gemini")] if not get_key(k)]
+        if missing:
+            st.warning("Missing API keys: " + ", ".join(missing) + " — those steps would be skipped. Add them in Settings.")
+        if st.button("🚀 Run everything", type="primary", width="stretch"):
+            start_full_pipeline()
+            st.rerun()
 
 # ============================================================================
 # PAGE: Write
@@ -1562,6 +1771,10 @@ def page_write():
     st.caption("Clean up messy titles, then draft a personal email and DM for every contactable artist.")
 
     df = st.session_state.df
+    if _pipeline_job()["running"]:
+        st.info("🚀 The one-click pipeline is running (see **Collect** for live progress). "
+                "Write is paused until it finishes so the two don't overwrite each other.")
+        return
     if df.empty:
         st.info("No leads yet. Sync a playlist in **Collect** first.")
         return
@@ -1684,6 +1897,11 @@ def page_send():
     show_flash()
     st.title("📤 Send")
     st.caption("Review one artist at a time, send, and mark it done. Follow-ups surface here too.")
+
+    if _pipeline_job()["running"]:
+        st.info("🚀 The one-click pipeline is running (see **Collect** for live progress). "
+                "Send is paused until it finishes so nothing gets overwritten mid-run.")
+        return
 
     df = st.session_state.df
     # Contacted artists (emailed OR DM'd) drop out of the queue.
@@ -1910,6 +2128,15 @@ def page_leads():
     elif crm_filter == "Paid": filtered_df = filtered_df[filtered_df["Paid Customer"] == True]
 
     st.caption(f"Showing {len(filtered_df)} of {len(st.session_state.df)} artists · amber = contacted · red = follow-up due · green = replied · gold = paying client · 🗑️ removes AND bans, ❌ just removes")
+
+    if _pipeline_job()["running"]:
+        st.warning("🚀 The one-click pipeline is running — the table is read-only until it finishes, "
+                   "so your edits and the incoming data can't overwrite each other. Live progress is in **Collect**.")
+        st.dataframe(
+            filtered_df.drop(columns=["🗑️ Blacklist", "❌ Remove", "🔄 Regenerate", "Channel_ID", "Channel_URL"], errors="ignore"),
+            width="stretch", hide_index=True,
+        )
+        return
 
     edited_df = st.data_editor(
         filtered_df.style.apply(highlight_rows, axis=1),
