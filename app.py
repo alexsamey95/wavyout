@@ -2114,10 +2114,11 @@ def page_leads():
         return
 
     search = st.text_input("Search", placeholder="Search by artist name, Instagram, or email...", label_visibility="collapsed")
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns([1, 1, 1.2, 2])
     with col1: email_filter = st.radio("Email", ["All", "Has email", "No email"], horizontal=True)
     with col2: ig_filter = st.radio("Instagram", ["All", "Has IG", "No IG"], horizontal=True)
-    with col3: crm_filter = st.radio("Pipeline", ["All", "Not contacted", "Contacted", "Emailed", "DM'd", "Replied", "Free mix sent", "Paid"], horizontal=True)
+    with col3: follow_filter = st.radio("Followed", ["All", "➕ Followed", "Not followed"], horizontal=True)
+    with col4: crm_filter = st.radio("Pipeline", ["All", "Not contacted", "Contacted", "Emailed", "DM'd", "Replied", "Free mix sent", "Paid"], horizontal=True)
 
     filtered_df = st.session_state.df.copy()
 
@@ -2140,6 +2141,8 @@ def page_leads():
     elif email_filter == "No email": filtered_df = filtered_df[~filtered_df["Email Address"].apply(is_valid_data).astype(bool)]
     if ig_filter == "Has IG": filtered_df = filtered_df[filtered_df["Instagram"].apply(is_valid_data).astype(bool)]
     elif ig_filter == "No IG": filtered_df = filtered_df[~filtered_df["Instagram"].apply(is_valid_data).astype(bool)]
+    if follow_filter == "➕ Followed": filtered_df = filtered_df[filtered_df["Followed"] == True]
+    elif follow_filter == "Not followed": filtered_df = filtered_df[filtered_df["Followed"] == False]
     if crm_filter == "Not contacted": filtered_df = filtered_df[filtered_df["Reached Out"] == False]
     elif crm_filter == "Contacted": filtered_df = filtered_df[(filtered_df["Reached Out"] == True) & (filtered_df["Replied"] == False)]
     elif crm_filter == "Emailed": filtered_df = filtered_df[filtered_df["Emailed"] == True]
@@ -2457,59 +2460,74 @@ try:
     var P = window.parent;
     var D = P.document;
     var KEY = "wavy-scroll:" + P.location.pathname;
-    var restoring = true;
 
-    function targets() {
-      var out = [];
-      var main = D.querySelector('section[data-testid="stMain"]') ||
-                 D.querySelector("section.stMain") ||
-                 D.querySelector("section.main") ||
-                 D.querySelector('[data-testid="stAppViewContainer"]');
-      if (main) out.push(["page", main]);
-      var grids = D.querySelectorAll(".dvn-scroller");
-      for (var i = 0; i < grids.length; i++) out.push(["grid" + i, grids[i]]);
-      return out;
+    function pageEl() {
+      return D.querySelector('section[data-testid="stMain"]') ||
+             D.querySelector("section.stMain") ||
+             D.querySelector("section.main") ||
+             D.querySelector('[data-testid="stAppViewContainer"]') ||
+             D.scrollingElement;
     }
-
+    function grids() { return D.querySelectorAll(".dvn-scroller"); }
+    function load() {
+      try { return JSON.parse(P.sessionStorage.getItem(KEY) || "{}"); } catch (e) { return {}; }
+    }
     function save() {
-      if (restoring) return;
       var pos = { win: [P.scrollX || 0, P.scrollY || 0] };
-      var ts = targets();
-      for (var i = 0; i < ts.length; i++) pos[ts[i][0]] = [ts[i][1].scrollLeft, ts[i][1].scrollTop];
+      var pe = pageEl();
+      if (pe) pos.page = [pe.scrollLeft || 0, pe.scrollTop || 0];
+      var gs = grids();
+      for (var i = 0; i < gs.length; i++) pos["grid" + i] = [gs[i].scrollLeft, gs[i].scrollTop];
       try { P.sessionStorage.setItem(KEY, JSON.stringify(pos)); } catch (e) {}
     }
+    var saveSoon;
+    function saveDebounced() { clearTimeout(saveSoon); saveSoon = setTimeout(save, 120); }
 
-    function hook() {
-      var ts = targets();
-      for (var i = 0; i < ts.length; i++) {
-        var el = ts[i][1];
-        if (!el.dataset.wavyHook) {
-          el.dataset.wavyHook = "1";
-          el.addEventListener("scroll", save, { passive: true });
-        }
-      }
-      if (!D.body.dataset.wavyWinHook) {
-        D.body.dataset.wavyWinHook = "1";
-        P.addEventListener("scroll", save, { passive: true });
+    function restorePage(saved) {
+      var pe = pageEl();
+      if (pe && saved.page) { pe.scrollLeft = saved.page[0]; pe.scrollTop = saved.page[1]; }
+      if (saved.win && (saved.win[0] || saved.win[1])) P.scrollTo(saved.win[0], saved.win[1]);
+    }
+    function restoreGrids(saved, onlyIdx) {
+      var gs = grids();
+      for (var i = 0; i < gs.length; i++) {
+        if (onlyIdx && onlyIdx.indexOf(i) === -1) continue;
+        var p = saved["grid" + i];
+        if (p) { gs[i].scrollLeft = p[0]; gs[i].scrollTop = p[1]; }
       }
     }
 
-    var saved = {};
-    try { saved = JSON.parse(P.sessionStorage.getItem(KEY) || "{}"); } catch (e) {}
-
-    var tries = 0;
-    var timer = setInterval(function () {
-      tries += 1;
-      hook();
-      var ts = targets();
-      for (var i = 0; i < ts.length; i++) {
-        var p = saved[ts[i][0]];
-        if (p) { ts[i][1].scrollLeft = p[0]; ts[i][1].scrollTop = p[1]; }
+    // Watcher (runs for the whole session): hooks save listeners onto elements,
+    // and whenever a NEW table appears — which is what happens on every rerun
+    // after an edit, because Streamlit rebuilds the table — it puts the table
+    // and the page right back where the user was.
+    var bootAt = Date.now();
+    setInterval(function () {
+      var saved = load();
+      var freshGrids = [];
+      var gs = grids();
+      for (var i = 0; i < gs.length; i++) {
+        if (!gs[i].dataset.wavyHook) {
+          gs[i].dataset.wavyHook = "1";
+          gs[i].addEventListener("scroll", saveDebounced, { passive: true });
+          freshGrids.push(i);
+        }
       }
-      if (saved.win) P.scrollTo(saved.win[0], saved.win[1]);
-      if (tries >= 8) { clearInterval(timer); restoring = false; }
-    }, 120);
-    setInterval(hook, 700);
+      var pe = pageEl();
+      if (pe && !pe.dataset.wavyHook) {
+        pe.dataset.wavyHook = "1";
+        pe.addEventListener("scroll", saveDebounced, { passive: true });
+        if (Date.now() - bootAt < 4000) restorePage(saved);  // fresh page load
+      }
+      if (!D.body.dataset.wavyWin) {
+        D.body.dataset.wavyWin = "1";
+        P.addEventListener("scroll", saveDebounced, { passive: true });
+      }
+      if (freshGrids.length) {
+        restoreGrids(saved, Date.now() - bootAt < 4000 ? null : freshGrids);
+        restorePage(saved);  // a rebuilt table means a rerun just moved the page
+      }
+    }, 200);
   } catch (e) {}
 })();
 </script>
