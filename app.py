@@ -87,7 +87,7 @@ def get_key(name):
 # Schema — one lead table for the whole pipeline
 # ----------------------------------------------------------------------------
 COLUMN_ORDER = [
-    "🗑️ Blacklist", "❌ Remove", "Emailed", "DM'd", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Reached_Out_Date", "Email_Date", "DM_Date", "Mix_Date", "Paid_Date", "Added_Date",
+    "🗑️ Blacklist", "❌ Remove", "Followed", "Emailed", "DM'd", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "Revenue", "Followed_Date", "Reached_Out_Date", "Email_Date", "DM_Date", "Mix_Date", "Paid_Date", "Added_Date",
     "Channel_ID", "Channel Name", "Cleaned Artist", "Cleaned Song",
     "Song Name", "Subscribers", "Email Address", "Instagram", "IG Followers",
     "IG Bio", "Draft Message", "🔄 Regenerate",
@@ -100,7 +100,7 @@ TEXT_DEFAULTS = {
     "IG Bio": "Not Scanned", "Draft Message": "",
     "Channel_URL": "", "Google Search Status": "Not Searched", "🔍 Quick Search": "",
 }
-BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Emailed", "DM'd", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "🔄 Regenerate"]
+BOOL_COLS = ["🗑️ Blacklist", "❌ Remove", "Followed", "Emailed", "DM'd", "Reached Out", "Replied", "Free Mix Sent", "Paid Customer", "🔄 Regenerate"]
 INT_COLS = ["Subscribers", "IG Followers"]
 
 def quick_search_url(name):
@@ -152,7 +152,7 @@ def ensure_schema(df):
             df[_flag] = False
         df[_flag] = df[_flag].map(lambda v: str(v).strip().lower() == "true" if not isinstance(v, bool) else v).fillna(False).astype(bool)
 
-    for dcol in ["Reached_Out_Date", "Email_Date", "DM_Date", "Mix_Date", "Paid_Date", "Added_Date"]:
+    for dcol in ["Followed_Date", "Reached_Out_Date", "Email_Date", "DM_Date", "Mix_Date", "Paid_Date", "Added_Date"]:
         if dcol not in df.columns:
             df[dcol] = pd.NaT
         df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
@@ -882,7 +882,7 @@ def mark_channel_sent(idx, flag_col, date_col, row):
 def pipeline_stats(df):
     if df.empty:
         return {"total": 0, "contactable": 0, "drafted": 0, "contacted": 0, "replied": 0,
-                "free_mix": 0, "paid": 0, "revenue": 0.0}
+                "free_mix": 0, "paid": 0, "revenue": 0.0, "followed": 0}
     contactable = df.apply(lambda r: is_valid_data(r["Email Address"]) or is_valid_data(r["Instagram"]), axis=1).sum()
     drafted = df.apply(has_any_draft, axis=1).sum()
     return {
@@ -890,6 +890,7 @@ def pipeline_stats(df):
         "contactable": int(contactable),
         "drafted": int(drafted),
         "contacted": int(df["Reached Out"].sum()),
+        "followed": int(df["Followed"].sum()) if "Followed" in df.columns else 0,
         "replied": int(df["Replied"].sum()),
         "free_mix": int(df["Free Mix Sent"].sum()) if "Free Mix Sent" in df.columns else 0,
         "paid": int(df["Paid Customer"].sum()) if "Paid Customer" in df.columns else 0,
@@ -1909,13 +1910,20 @@ def page_send():
                  if has_any_draft(df.loc[i]) and pending_channels(df.loc[i])
                  and not bool(df.loc[i, "Reached Out"])] if not df.empty else []
 
-    chan = st.radio("Channel", ["All", "✉️ Email pending", "📸 DM pending"], horizontal=True, key="send_chan")
+    fc1, fc2 = st.columns(2)
+    chan = fc1.radio("Channel", ["All", "✉️ Email pending", "📸 DM pending"], horizontal=True, key="send_chan")
+    fstat = fc2.radio("Follow status", ["All", "➕ Not followed", "✅ Followed"], horizontal=True, key="send_follow",
+                      help="Follow-first flow: pass 1 — follow everyone here. Pass 2 — filter to Followed and DM the ones who followed back.")
     if chan == "✉️ Email pending":
         queue_idx = [i for i in queue_all if "email" in pending_channels(df.loc[i])]
     elif chan == "📸 DM pending":
         queue_idx = [i for i in queue_all if "ig" in pending_channels(df.loc[i])]
     else:
         queue_idx = queue_all
+    if fstat == "➕ Not followed":
+        queue_idx = [i for i in queue_idx if not bool(df.loc[i, "Followed"])]
+    elif fstat == "✅ Followed":
+        queue_idx = [i for i in queue_idx if bool(df.loc[i, "Followed"])]
 
     if not queue_idx:
         if queue_all:
@@ -1966,6 +1974,19 @@ def page_send():
                     st.link_button("▶️ YouTube channel", row["Channel_URL"], width="stretch")
                 if is_valid_data(row["Instagram"]):
                     st.link_button("📸 Instagram profile", row["Instagram"], width="stretch")
+                    if bool(row.get("Followed", False)):
+                        fd = row.get("Followed_Date")
+                        if pd.notna(fd):
+                            days_ago = (pd.Timestamp.now().normalize() - pd.to_datetime(fd)).days
+                            st.caption(f"➕ Followed {pd.to_datetime(fd):%b %d} · {days_ago}d ago — check if they follow back before you DM.")
+                        else:
+                            st.caption("➕ Followed — check if they follow back before you DM.")
+                    elif st.button("➕ Mark followed", key=f"fol_{choice}", width="stretch",
+                                   help="Tick after you tap Follow on their profile — the date stamps automatically."):
+                        st.session_state.df.loc[choice, "Followed"] = True
+                        st.session_state.df.loc[choice, "Followed_Date"] = pd.Timestamp.now().normalize()
+                        save_db(st.session_state.df)
+                        st.rerun()
                 if is_valid_data(row.get("IG Bio", "")):
                     with st.expander("IG bio"):
                         st.write(row["IG Bio"])
@@ -2147,6 +2168,7 @@ def page_leads():
             "Draft Message": st.column_config.TextColumn("Message", width="large", max_chars=2000),
             "🗑️ Blacklist": st.column_config.CheckboxColumn("🗑️", help="Remove this lead AND ban the channel from future syncs."),
             "❌ Remove": st.column_config.CheckboxColumn("❌", help="Delete this lead without banning — it can come back on a future sync."),
+            "Followed": st.column_config.CheckboxColumn("➕ Followed", help="Tick when you follow them on IG — the date stamps automatically."),
             "Emailed": st.column_config.CheckboxColumn("✉️ Emailed", help="Tick when the email goes out — the date stamps automatically."),
             "DM'd": st.column_config.CheckboxColumn("📸 DM'd", help="Tick when the DM goes out — the date stamps automatically."),
             "Reached Out": st.column_config.CheckboxColumn("Reached", disabled=True, help="Automatic: ticks as soon as you've emailed or DM'd this artist."),
@@ -2158,6 +2180,7 @@ def page_leads():
             "Reached_Out_Date": st.column_config.DateColumn("First contact", disabled=True, format="MMM DD, YYYY"),
             "Email_Date": st.column_config.DateColumn("Emailed on", disabled=True, format="MMM DD"),
             "DM_Date": st.column_config.DateColumn("DM'd on", disabled=True, format="MMM DD"),
+            "Followed_Date": st.column_config.DateColumn("Followed on", disabled=True, format="MMM DD"),
             "Mix_Date": None,
             "Paid_Date": None,
             "Added_Date": None,
@@ -2200,7 +2223,7 @@ def page_leads():
             changes_made = True
             st.session_state.df.loc[st.session_state.df["Channel_ID"] == ch_id, "Replied"] = is_replied
 
-        for flag_col, date_col in [("Emailed", "Email_Date"), ("DM'd", "DM_Date"), ("Free Mix Sent", "Mix_Date"), ("Paid Customer", "Paid_Date")]:
+        for flag_col, date_col in [("Followed", "Followed_Date"), ("Emailed", "Email_Date"), ("DM'd", "DM_Date"), ("Free Mix Sent", "Mix_Date"), ("Paid Customer", "Paid_Date")]:
             was_f = filtered_df.loc[idx, flag_col]
             is_f = edited_df.loc[idx, flag_col]
             if is_f != was_f:
@@ -2413,7 +2436,7 @@ with st.sidebar:
     stats = pipeline_stats(st.session_state.df)
     st.divider()
     st.caption("🎛️ **Wavy Outreach**")
-    st.caption(f"{stats['total']} leads · {stats['contacted']} contacted · {stats['replied']} replied")
+    st.caption(f"{stats['total']} leads · {stats['followed']} followed · {stats['contacted']} contacted · {stats['replied']} replied")
     dots = " · ".join(("🟢" if get_key(n) else "⚪") + " " + lbl for n, lbl in KEY_NAMES.items())
     st.caption(dots)
 
